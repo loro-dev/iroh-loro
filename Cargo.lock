@@ -2400,7 +2400,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-broadcast",
+ "bytes",
  "clap",
+ "futures",
  "iroh",
  "loro",
  "notify",

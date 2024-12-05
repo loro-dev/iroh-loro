@@ -137,6 +137,10 @@ async fn main() -> anyhow::Result<()> {
             file_path,
         } => {
             let doc = loro::LoroDoc::new();
+            if !std::path::Path::new(&file_path).exists() {
+                std::fs::write(&file_path, "").unwrap();
+                println!("Created new file at: {}", file_path);
+            }
             let (p, iroh, _writer) = setup_node(doc, file_path.clone(), None).await?;
             let _watcher = spawn_file_watcher(file_path, p.clone());
 

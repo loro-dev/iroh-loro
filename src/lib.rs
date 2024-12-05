@@ -79,39 +79,47 @@ impl IrohLoroProtocol {
                 }
             }
         });
+
+        let self_clone = self.clone();
+        let mut recv_clone = recv;
+        let handle = tokio::spawn(async move {
+            loop {
+                match Self::recv_msg(&mut recv_clone).await {
+                    Ok(Protocol::Ack) => {
+                        println!("📥 Received ack from peer");
+                    }
+                    Ok(Protocol::SyncMessage(sync_msg)) => {
+                        println!(
+                            "📥 Received sync message from peer (size={})",
+                            sync_msg.len()
+                        );
+                        if let Err(e) = self_clone.inner.lock().await.import(&sync_msg) {
+                            println!("❌ Failed to import sync message: {}", e);
+                            return Err(anyhow::Error::from(e));
+                        }
+                        println!("✅ Successfully imported sync message");
+
+                        self_clone
+                            .sender
+                            .send(self_clone.inner.lock().await.get_text("text").to_string())
+                            .await?;
+                        println!("✅ Successfully sent update to local");
+                        Self::send_msg(Protocol::Ack, send_clone.lock().await.deref_mut()).await?;
+                    }
+                    Err(e) => {
+                        println!("🔌 Connection closed or error: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
+        });
+
         select! {
             _ = conn.closed() => {
                 println!("🔌 Peer disconnected");
             }
-            result = async {
-                loop {
-                    match Self::recv_msg(&mut recv).await {
-                        Ok(Protocol::Ack) => {
-                            println!("📥 Received ack from peer");
-                        }
-                        Ok(Protocol::SyncMessage(sync_msg)) => {
-                            println!("📥 Received sync message from peer (size={})", sync_msg.len());
-                            if let Err(e) = self.inner.lock().await.import(&sync_msg) {
-                                println!("❌ Failed to import sync message: {}", e);
-                                return Err(anyhow::Error::from(e));
-                            }
-                            println!("✅ Successfully imported sync message");
-
-                            self.sender
-                                .send(self.inner.lock().await.get_text("text").to_string())
-                                .await?;
-                            println!("✅ Successfully sent update to local");
-                            Self::send_msg(Protocol::Ack, send_clone.lock().await.deref_mut())
-                                .await?;
-                        }
-                        Err(e) => {
-                            println!("🔌 Connection closed or error: {}", e);
-                            return Ok(());
-                        }
-                    }
-                }
-            } => {
-                result?
+            result = handle => {
+                result??;
             }
         }
 
@@ -160,38 +168,45 @@ impl IrohLoroProtocol {
                 }
             }
         });
+        let handle = tokio::spawn(async move {
+            loop {
+                match Self::recv_msg(&mut recv).await {
+                    Ok(Protocol::Ack) => {
+                        println!("📥 Received ack from peer");
+                    }
+                    Ok(Protocol::SyncMessage(sync_msg)) => {
+                        println!(
+                            "📥 Received sync message from peer (size={})",
+                            sync_msg.len()
+                        );
+                        if let Err(e) = self.inner.lock().await.import(&sync_msg) {
+                            println!("❌ Failed to import sync message: {}", e);
+                            return Err(anyhow::Error::from(e));
+                        }
+                        println!("✅ Successfully imported sync message");
+
+                        self.sender
+                            .send(self.inner.lock().await.get_text("text").to_string())
+                            .await?;
+                        println!("✅ Successfully sent update to local");
+                        Self::send_msg(Protocol::Ack, send_clone.lock().await.deref_mut())
+                            .await
+                            .unwrap();
+                    }
+                    Err(e) => {
+                        println!("🔌 Connection closed or error: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
+        });
+
         select! {
             _ = conn.closed() => {
                 println!("🔌 Peer disconnected");
             }
-            result = async {
-                loop {
-                    match Self::recv_msg(&mut recv).await {
-                        Ok(Protocol::Ack) => {
-                            println!("📥 Received ack from peer");
-                        }
-                        Ok(Protocol::SyncMessage(sync_msg)) => {
-                            println!("📥 Received sync message from peer (size={})", sync_msg.len());
-                            if let Err(e) = self.inner.lock().await.import(&sync_msg) {
-                                println!("❌ Failed to import sync message: {}", e);
-                                return Err(anyhow::Error::from(e));
-                            }
-                            println!("✅ Successfully imported sync message");
-
-                            self.sender
-                                .send(self.inner.lock().await.get_text("text").to_string())
-                                .await?;
-                            println!("✅ Successfully sent update to local");
-                            Self::send_msg(Protocol::Ack, send_clone.lock().await.deref_mut()).await.unwrap();
-                        }
-                        Err(e) => {
-                            println!("🔌 Connection closed or error: {}", e);
-                            return Ok(());
-                        }
-                    }
-                }
-            } => {
-                result?
+            result = handle => {
+                result??;
             }
         }
 
