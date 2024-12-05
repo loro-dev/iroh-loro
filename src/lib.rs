@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::Result;
-use iroh::router::ProtocolHandler;
+use iroh::protocol::ProtocolHandler;
 use loro::{ExportMode, LoroDoc};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -44,10 +44,7 @@ impl IrohLoroProtocol {
         println!("✅ Local update committed");
     }
 
-    pub async fn initiate_sync(
-        self: Arc<Self>,
-        conn: iroh::net::endpoint::Connection,
-    ) -> Result<()> {
+    pub async fn initiate_sync(self: Arc<Self>, conn: iroh::endpoint::Connection) -> Result<()> {
         let (tx, rx) = async_channel::bounded(128);
         let _sub = self
             .inner
@@ -108,10 +105,7 @@ impl IrohLoroProtocol {
         }
     }
 
-    pub async fn respond_sync(
-        self: Arc<Self>,
-        conn: iroh::net::endpoint::Connecting,
-    ) -> Result<()> {
+    pub async fn respond_sync(self: Arc<Self>, conn: iroh::endpoint::Connecting) -> Result<()> {
         let conn = conn.await?;
         self.initiate_sync(conn).await
     }
@@ -120,7 +114,7 @@ impl IrohLoroProtocol {
 impl ProtocolHandler for IrohLoroProtocol {
     fn accept(
         self: Arc<Self>,
-        conn: iroh::net::endpoint::Connecting,
+        conn: iroh::endpoint::Connecting,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
         Box::pin(async move {
             println!("🔌 Peer connected");
