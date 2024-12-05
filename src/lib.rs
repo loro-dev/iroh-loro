@@ -1,11 +1,8 @@
-use std::{future::Future, ops::DerefMut, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::Result;
-use iroh::{
-    net::endpoint::{RecvStream, SendStream},
-    router::ProtocolHandler,
-};
-use loro::LoroDoc;
+use iroh::router::ProtocolHandler;
+use loro::{ExportMode, LoroDoc};
 use serde::{Deserialize, Serialize};
 use tokio::{
     select,
@@ -51,80 +48,64 @@ impl IrohLoroProtocol {
         self: Arc<Self>,
         conn: iroh::net::endpoint::Connection,
     ) -> Result<()> {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = async_channel::bounded(128);
         let _sub = self
             .inner
             .lock()
             .await
             .subscribe_local_update(Box::new(move |u| {
-                tx.send(u.clone()).unwrap();
+                tx.send_blocking(u.clone()).unwrap();
                 true
             }));
-        Self::send_msg(Protocol::Ack, &mut send).await.unwrap();
-        let send = Arc::new(tokio::sync::Mutex::new(send));
-        let send_clone = send.clone();
-        let _h = tokio::spawn({
-            async move {
-                while let Ok(update) = rx.recv() {
-                    println!("📤 Sending local update to peer (size={})", update.len());
-                    if let Err(e) =
-                        Self::send_msg(Protocol::SyncMessage(update), send.lock().await.deref_mut())
-                            .await
-                    {
-                        println!("❌ Failed to send update: {}", e);
-                        break;
-                    }
+
+        let sync = self.inner.lock().await.export(ExportMode::all_updates())?;
+
+        // Initial sync
+        let mut stream = conn.open_uni().await?;
+        stream.write_all(&sync).await?;
+        stream.finish()?;
+
+        // Wait for changes & sync
+        loop {
+            select! {
+                close = conn.closed() => {
+                    println!("🔌 Peer disconnected: {close:?}");
+                    return Ok(());
+                },
+                // Incoming sync messages
+                stream = conn.accept_uni() => {
+                    let mut stream = stream?;
+                    tokio::spawn({
+                        let this = self.clone();
+                        async move {
+                            let msg = stream.read_to_end(10_000).await?; // 10 KB limit for now
+                            println!("📥 Received sync message from peer (size={})", msg.len());
+                            if let Err(e) = this.inner.lock().await.import(&msg) {
+                                println!("❌ Failed to import sync message: {}", e);
+                            };
+                            println!("✅ Successfully imported sync message");
+
+                            this.sender
+                                .send(this.inner.lock().await.get_text("text").to_string())
+                                .await?;
+
+                            println!("✅ Successfully sent update to local");
+
+                            anyhow::Ok(())
+                        }
+                    });
+                },
+                // Responses to local document changes
+                msg = rx.recv() => {
+                    let msg = msg?;
+                    println!("📤 Sending update to peer (size={})", msg.len());
+                    let mut stream = conn.open_uni().await?;
+                    stream.write_all(&msg).await?;
+                    stream.finish()?;
                     println!("✅ Successfully sent update to peer");
                 }
             }
-        });
-
-        let self_clone = self.clone();
-        let mut recv_clone = recv;
-        let handle = tokio::spawn(async move {
-            loop {
-                match Self::recv_msg(&mut recv_clone).await {
-                    Ok(Protocol::Ack) => {
-                        println!("📥 Received ack from peer");
-                    }
-                    Ok(Protocol::SyncMessage(sync_msg)) => {
-                        println!(
-                            "📥 Received sync message from peer (size={})",
-                            sync_msg.len()
-                        );
-                        if let Err(e) = self_clone.inner.lock().await.import(&sync_msg) {
-                            println!("❌ Failed to import sync message: {}", e);
-                            return Err(anyhow::Error::from(e));
-                        }
-                        println!("✅ Successfully imported sync message");
-
-                        self_clone
-                            .sender
-                            .send(self_clone.inner.lock().await.get_text("text").to_string())
-                            .await?;
-                        println!("✅ Successfully sent update to local");
-                        Self::send_msg(Protocol::Ack, send_clone.lock().await.deref_mut()).await?;
-                    }
-                    Err(e) => {
-                        println!("🔌 Connection closed or error: {}", e);
-                        return Ok(());
-                    }
-                }
-            }
-        });
-
-        select! {
-            _ = conn.closed() => {
-                println!("🔌 Peer disconnected");
-            }
-            result = handle => {
-                result??;
-            }
         }
-
-        println!("DONE!");
-        Ok(())
     }
 
     pub async fn respond_sync(
@@ -132,113 +113,7 @@ impl IrohLoroProtocol {
         conn: iroh::net::endpoint::Connecting,
     ) -> Result<()> {
         let conn = conn.await?;
-        let (mut send, mut recv) = conn.accept_bi().await?;
-        let loro_doc = self.inner.lock().await;
-        let mut last_version = loro_doc.oplog_vv();
-        let bytes = loro_doc.export(loro::ExportMode::Snapshot).unwrap();
-        Self::send_msg(Protocol::SyncMessage(bytes.clone()), &mut send).await?;
-        // Self::send_msg(Protocol::SyncMessage(bytes), &mut send).await?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _sub = loro_doc.subscribe_root(Arc::new(move |_| {
-            tx.send(()).unwrap();
-        }));
-        drop(loro_doc);
-        let this = self.clone();
-        let send = Arc::new(tokio::sync::Mutex::new(send));
-        let send_clone = send.clone();
-        let _h = tokio::spawn({
-            async move {
-                while let Ok(_) = rx.recv() {
-                    let update = this
-                        .inner
-                        .lock()
-                        .await
-                        .export(loro::ExportMode::updates(&last_version))
-                        .unwrap();
-                    last_version = this.inner.lock().await.oplog_vv();
-                    println!("📤 Sending update to peer (size={})", update.len());
-                    if let Err(e) =
-                        Self::send_msg(Protocol::SyncMessage(update), send.lock().await.deref_mut())
-                            .await
-                    {
-                        println!("❌ Failed to send update: {}", e);
-                        break;
-                    }
-                    println!("✅ Successfully sent update to peer");
-                }
-            }
-        });
-        let handle = tokio::spawn(async move {
-            loop {
-                match Self::recv_msg(&mut recv).await {
-                    Ok(Protocol::Ack) => {
-                        println!("📥 Received ack from peer");
-                    }
-                    Ok(Protocol::SyncMessage(sync_msg)) => {
-                        println!(
-                            "📥 Received sync message from peer (size={})",
-                            sync_msg.len()
-                        );
-                        if let Err(e) = self.inner.lock().await.import(&sync_msg) {
-                            println!("❌ Failed to import sync message: {}", e);
-                            return Err(anyhow::Error::from(e));
-                        }
-                        println!("✅ Successfully imported sync message");
-
-                        self.sender
-                            .send(self.inner.lock().await.get_text("text").to_string())
-                            .await?;
-                        println!("✅ Successfully sent update to local");
-                        Self::send_msg(Protocol::Ack, send_clone.lock().await.deref_mut())
-                            .await
-                            .unwrap();
-                    }
-                    Err(e) => {
-                        println!("🔌 Connection closed or error: {}", e);
-                        return Ok(());
-                    }
-                }
-            }
-        });
-
-        select! {
-            _ = conn.closed() => {
-                println!("🔌 Peer disconnected");
-            }
-            result = handle => {
-                result??;
-            }
-        }
-
-        println!("DONE!");
-        Ok(())
-    }
-
-    async fn send_msg(msg: Protocol, send: &mut SendStream) -> Result<()> {
-        let encoded = postcard::to_stdvec(&msg)?;
-        send.write_all(&(encoded.len() as u64).to_le_bytes())
-            .await?;
-        send.write_all(&encoded).await?;
-        Ok(())
-    }
-
-    async fn recv_msg(recv: &mut RecvStream) -> Result<Protocol> {
-        let mut incoming_len = [0u8; 8];
-        if let Err(e) = recv.read_exact(&mut incoming_len).await {
-            println!("📡 Connection closed while reading length: {}", e);
-            return Err(e.into());
-        }
-        let len = u64::from_le_bytes(incoming_len);
-        println!("📨 Reading message of length: {}", len);
-
-        let mut buffer = vec![0u8; len as usize];
-        if let Err(e) = recv.read_exact(&mut buffer).await {
-            println!("📡 Connection closed while reading message: {}", e);
-            return Err(e.into());
-        }
-
-        let msg = postcard::from_bytes(&buffer)?;
-        Ok(msg)
+        self.initiate_sync(conn).await
     }
 }
 

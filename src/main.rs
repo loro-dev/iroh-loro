@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
             doc.commit();
             println!("Serving file: {}", file_path);
 
-            let (p, _iroh, _writer) = setup_node(
+            let (p, iroh, _writer) = setup_node(
                 doc,
                 file_path.clone(),
                 Some(SecretKey::from_bytes(&[114; 32])),
@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
             // Wait for Ctrl+C
             signal::ctrl_c().await?;
             println!("Received Ctrl+C, shutting down...");
+            iroh.shutdown().await?;
         }
 
         Cli::Join {
@@ -156,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
             // Wait for Ctrl+C
             signal::ctrl_c().await?;
             println!("Received Ctrl+C, shutting down...");
+            iroh.shutdown().await?;
         }
     }
 

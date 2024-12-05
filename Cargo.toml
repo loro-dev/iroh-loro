@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.80"
 async-broadcast = "0.7.1"
+async-channel = "2.3.1"
 clap = { version = "4.5.1", features = ["derive"] }
 iroh = "0.28"
 loro = "1.1.0"
