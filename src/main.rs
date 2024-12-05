@@ -1,6 +1,6 @@
+use anyhow::Context;
 use clap::{Parser, command};
-use iroh::net::key::SecretKey;
-use iroh::{blobs::store::mem::Store, node::Node, router::ProtocolHandler};
+use iroh::protocol::ProtocolHandler;
 use iroh_loro::IrohLoroProtocol;
 use notify::Watcher;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ enum Cli {
         file_path: String,
     },
     Join {
-        remote_id: iroh::net::NodeId,
+        remote_id: iroh::NodeId,
         file_path: String,
     },
 }
@@ -27,12 +27,24 @@ async fn main() -> anyhow::Result<()> {
     async fn setup_node(
         doc: loro::LoroDoc,
         file_path: String,
-        secret_key: Option<SecretKey>,
+        key_path: Option<&str>,
     ) -> anyhow::Result<(
         Arc<IrohLoroProtocol>,
-        Node<Store>,
+        iroh::protocol::Router,
         tokio::task::JoinHandle<()>,
     )> {
+        let secret_key = if let Some(key_path) = key_path {
+            iroh_node_util::load_secret_key(
+                dirs_next::cache_dir()
+                    .context("no dir for secret key")?
+                    .join("iroh-loro")
+                    .join(key_path),
+            )
+            .await?
+        } else {
+            iroh::key::SecretKey::generate()
+        };
+
         let (tx, mut rx) = mpsc::channel(100);
         let p = IrohLoroProtocol::new(doc, tx);
 
@@ -47,23 +59,22 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        let mut node = Node::memory();
-        if let Some(s) = secret_key {
-            node = node.secret_key(s);
-        }
+        let endpoint = iroh::Endpoint::builder()
+            .discovery_n0()
+            .secret_key(secret_key)
+            .bind()
+            .await?;
 
         // Create and configure iroh node
-        let iroh = node
-            .build()
-            .await?
+        let iroh = iroh::protocol::Router::builder(endpoint)
             .accept(
-                IrohLoroProtocol::ALPN.to_vec(),
+                IrohLoroProtocol::ALPN,
                 Arc::clone(&p) as Arc<dyn ProtocolHandler>,
             )
             .spawn()
             .await?;
 
-        let addr = iroh.net().node_addr().await?;
+        let addr = iroh.endpoint().node_addr().await?;
         println!("Running\nNode Id: {}", addr.node_id);
 
         Ok((p, iroh, writer_handle))
@@ -119,17 +130,14 @@ async fn main() -> anyhow::Result<()> {
             doc.commit();
             println!("Serving file: {}", file_path);
 
-            let (p, _iroh, _writer) = setup_node(
-                doc,
-                file_path.clone(),
-                Some(SecretKey::from_bytes(&[114; 32])),
-            )
-            .await?;
+            let (p, iroh, _writer) =
+                setup_node(doc, file_path.clone(), Some("key.ed25519")).await?;
             let _watcher = spawn_file_watcher(file_path, p);
 
             // Wait for Ctrl+C
             signal::ctrl_c().await?;
             println!("Received Ctrl+C, shutting down...");
+            iroh.shutdown().await?;
         }
 
         Cli::Join {
@@ -145,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
             let _watcher = spawn_file_watcher(file_path, p.clone());
 
             // Connect to remote node and sync
-            let node_addr = iroh::net::NodeAddr::new(remote_id);
+            let node_addr = iroh::NodeAddr::new(remote_id);
             let conn = iroh
                 .endpoint()
                 .connect(node_addr, IrohLoroProtocol::ALPN)
@@ -156,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
             // Wait for Ctrl+C
             signal::ctrl_c().await?;
             println!("Received Ctrl+C, shutting down...");
+            iroh.shutdown().await?;
         }
     }
 

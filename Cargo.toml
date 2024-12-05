@@ -6,8 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.80"
 async-broadcast = "0.7.1"
+async-channel = "2.3.1"
 clap = { version = "4.5.1", features = ["derive"] }
-iroh = "0.28"
+dirs-next = "2.0.0"
+iroh = "0.29"
+iroh-node-util = { version = "0.29.0", default-features = false }
 loro = "1.1.0"
 notify = "7.0.0"
 postcard = "1.0.8"
