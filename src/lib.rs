@@ -3,7 +3,6 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use anyhow::Result;
 use iroh::protocol::ProtocolHandler;
 use loro::{ExportMode, LoroDoc};
-use serde::{Deserialize, Serialize};
 use tokio::{
     select,
     sync::{Mutex, mpsc},
@@ -13,12 +12,6 @@ use tokio::{
 pub struct IrohLoroProtocol {
     inner: Mutex<LoroDoc>,
     sender: mpsc::Sender<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum Protocol {
-    SyncMessage(Vec<u8>),
-    Ack,
 }
 
 impl IrohLoroProtocol {
