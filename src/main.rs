@@ -1,9 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, command};
-use iroh::protocol::ProtocolHandler;
 use iroh_loro::IrohLoroProtocol;
 use notify::Watcher;
-use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc;
 
@@ -29,12 +27,12 @@ async fn main() -> anyhow::Result<()> {
         file_path: String,
         key_path: Option<&str>,
     ) -> anyhow::Result<(
-        Arc<IrohLoroProtocol>,
+        IrohLoroProtocol,
         iroh::protocol::Router,
         tokio::task::JoinHandle<()>,
     )> {
         let secret_key = if let Some(key_path) = key_path {
-            iroh_node_util::load_secret_key(
+            iroh_node_util::fs::load_secret_key(
                 dirs_next::cache_dir()
                     .context("no dir for secret key")?
                     .join("iroh-loro")
@@ -42,11 +40,11 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         } else {
-            iroh::key::SecretKey::generate()
+            iroh::SecretKey::generate(rand::rngs::OsRng)
         };
 
         let (tx, mut rx) = mpsc::channel(100);
-        let p = IrohLoroProtocol::new(doc, tx);
+        let protocol = IrohLoroProtocol::new(doc, tx);
 
         // Spawn file writer task
         let writer_handle = tokio::spawn(async move {
@@ -67,54 +65,46 @@ async fn main() -> anyhow::Result<()> {
 
         // Create and configure iroh node
         let iroh = iroh::protocol::Router::builder(endpoint)
-            .accept(
-                IrohLoroProtocol::ALPN,
-                Arc::clone(&p) as Arc<dyn ProtocolHandler>,
-            )
+            .accept(IrohLoroProtocol::ALPN, protocol.clone())
             .spawn()
             .await?;
 
         let addr = iroh.endpoint().node_addr().await?;
         println!("Running\nNode Id: {}", addr.node_id);
 
-        Ok((p, iroh, writer_handle))
+        Ok((protocol, iroh, writer_handle))
     }
 
     // Modified file watcher setup to return the JoinHandle
     fn spawn_file_watcher(
         file_path: String,
-        p: Arc<IrohLoroProtocol>,
+        protocol: IrohLoroProtocol,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            println!("👀 Starting file watcher for: {}", file_path);
-            let (notify_tx, mut notify_rx) = mpsc::channel(1);
+        tokio::task::spawn_blocking(move || {
+            let clone = file_path.clone();
+            let path = std::path::Path::new(&clone);
+
+            println!("👀 Starting file watcher for: {file_path}");
             let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
                 if let Ok(event) = res {
                     if let notify::EventKind::Modify(_) = event.kind {
                         println!("📝 File modification detected");
-                        let _ = notify_tx.blocking_send(());
+
+                        match std::fs::read_to_string(&file_path) {
+                            Ok(contents) => {
+                                println!("📖 Read file contents (length={})", contents.len());
+                                protocol.update_doc(&contents);
+                            }
+                            Err(e) => println!("❌ Failed to read file: {e}"),
+                        }
                     }
                 }
             })
             .unwrap();
-            watcher
-                .watch(
-                    std::path::Path::new(&file_path),
-                    notify::RecursiveMode::NonRecursive,
-                )
-                .unwrap();
 
-            loop {
-                if let Some(_) = notify_rx.recv().await {
-                    match std::fs::read_to_string(&file_path) {
-                        Ok(contents) => {
-                            println!("📖 Read file contents (length={})", contents.len());
-                            p.update_doc(&contents).await;
-                        }
-                        Err(e) => println!("❌ Failed to read file: {}", e),
-                    }
-                }
-            }
+            watcher
+                .watch(path, notify::RecursiveMode::NonRecursive)
+                .unwrap();
         })
     }
 
@@ -149,8 +139,8 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::write(&file_path, "").unwrap();
                 println!("Created new file at: {}", file_path);
             }
-            let (p, iroh, _writer) = setup_node(doc, file_path.clone(), None).await?;
-            let _watcher = spawn_file_watcher(file_path, p.clone());
+            let (protocol, iroh, _writer) = setup_node(doc, file_path.clone(), None).await?;
+            let _watcher = spawn_file_watcher(file_path, protocol.clone());
 
             // Connect to remote node and sync
             let node_addr = iroh::NodeAddr::new(remote_id);
@@ -159,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
                 .connect(node_addr, IrohLoroProtocol::ALPN)
                 .await?;
 
-            p.initiate_sync(conn).await?;
+            protocol.inner.initiate_sync(conn).await?;
 
             // Wait for Ctrl+C
             signal::ctrl_c().await?;
