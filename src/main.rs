@@ -30,8 +30,7 @@ async fn main() -> Result<()> {
             let contents = tokio::fs::read_to_string(&file_path).await?;
 
             let doc = loro::LoroDoc::new();
-            doc.get_text("text")
-                .update_by_line(&contents, loro::UpdateOptions::default())?;
+            doc.get_text("text").insert(0, &contents)?;
             doc.commit();
 
             println!("Serving file: {}", file_path);
@@ -186,7 +185,18 @@ async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()
                 println!("📝 File modification detected");
                 let contents = tokio::fs::read_to_string(&file_path).await?;
                 println!("📖 Read file contents (length={})", contents.len());
-                protocol.update_doc(&contents)?;
+                let mut opts = loro::UpdateOptions::default();
+                if contents.len() > 50_000 {
+                    opts.use_refined_diff = false;
+                    protocol
+                        .doc()
+                        .get_text("text")
+                        .update_by_line(&contents, opts)?;
+                } else {
+                    protocol.doc().get_text("text").update(&contents, opts)?;
+                }
+                protocol.doc().commit();
+                println!("✅ Local update committed");
             }
             _ => {
                 // Ignoring other watcher events
