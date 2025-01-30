@@ -80,31 +80,36 @@ async fn main() -> anyhow::Result<()> {
         file_path: String,
         protocol: IrohLoroProtocol,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::task::spawn_blocking(move || {
-            let clone = file_path.clone();
-            let path = std::path::Path::new(&clone);
-
-            println!("👀 Starting file watcher for: {file_path}");
+        tokio::spawn(async move {
+            println!("👀 Starting file watcher for: {}", file_path);
+            let (notify_tx, mut notify_rx) = mpsc::channel(1);
             let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
                 if let Ok(event) = res {
                     if let notify::EventKind::Modify(_) = event.kind {
                         println!("📝 File modification detected");
-
-                        match std::fs::read_to_string(&file_path) {
-                            Ok(contents) => {
-                                println!("📖 Read file contents (length={})", contents.len());
-                                protocol.update_doc(&contents);
-                            }
-                            Err(e) => println!("❌ Failed to read file: {e}"),
-                        }
+                        let _ = notify_tx.blocking_send(());
                     }
                 }
             })
             .unwrap();
-
             watcher
-                .watch(path, notify::RecursiveMode::NonRecursive)
+                .watch(
+                    std::path::Path::new(&file_path),
+                    notify::RecursiveMode::NonRecursive,
+                )
                 .unwrap();
+
+            loop {
+                if let Some(_) = notify_rx.recv().await {
+                    match std::fs::read_to_string(&file_path) {
+                        Ok(contents) => {
+                            println!("📖 Read file contents (length={})", contents.len());
+                            protocol.update_doc(&contents);
+                        }
+                        Err(e) => println!("❌ Failed to read file: {}", e),
+                    }
+                }
+            }
         })
     }
 
