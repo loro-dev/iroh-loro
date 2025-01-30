@@ -22,90 +22,6 @@ enum Cli {
 async fn main() -> anyhow::Result<()> {
     let opts = Cli::parse();
 
-    // Common setup function for both Serve and Join modes
-    async fn setup_node(
-        doc: loro::LoroDoc,
-        file_path: String,
-        key_path: Option<&str>,
-        tasks: &mut JoinSet<()>,
-    ) -> anyhow::Result<(IrohLoroProtocol, iroh::protocol::Router)> {
-        let secret_key = if let Some(key_path) = key_path {
-            iroh_node_util::fs::load_secret_key(
-                dirs_next::cache_dir()
-                    .context("no dir for secret key")?
-                    .join("iroh-loro")
-                    .join(key_path),
-            )
-            .await?
-        } else {
-            iroh::SecretKey::generate(rand::rngs::OsRng)
-        };
-
-        let (tx, mut rx) = mpsc::channel(100);
-        let protocol = IrohLoroProtocol::new(doc, tx);
-
-        // Spawn file writer task
-        tasks.spawn(async move {
-            while let Some(contents) = rx.recv().await {
-                println!("💾 Writing new contents to file. Length={}", contents.len());
-                match tokio::fs::write(&file_path, contents).await {
-                    Ok(_) => println!("✅ Successfully wrote to file"),
-                    Err(e) => println!("❌ Failed to write to file: {}", e),
-                }
-            }
-        });
-
-        let endpoint = iroh::Endpoint::builder()
-            .discovery_n0()
-            .secret_key(secret_key)
-            .bind()
-            .await?;
-
-        // Create and configure iroh node
-        let iroh = iroh::protocol::Router::builder(endpoint)
-            .accept(IrohLoroProtocol::ALPN, protocol.clone())
-            .spawn()
-            .await?;
-
-        let addr = iroh.endpoint().node_addr().await?;
-        println!("Running\nNode Id: {}", addr.node_id);
-
-        Ok((protocol, iroh))
-    }
-
-    // File watcher for watching given file path that updates the loro doc when it changes
-    async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()> {
-        println!("👀 Starting file watcher for: {}", file_path);
-        let (notify_tx, mut notify_rx) = mpsc::channel(10);
-        let mut watcher = notify::recommended_watcher(move |res| {
-            let _ = notify_tx.blocking_send(res); // ignore when the rx is dropped
-        })?;
-
-        watcher.watch(
-            std::path::Path::new(&file_path),
-            notify::RecursiveMode::NonRecursive,
-        )?;
-
-        while let Some(res) = notify_rx.recv().await {
-            match res? {
-                notify::Event {
-                    kind: notify::EventKind::Modify(_),
-                    ..
-                } => {
-                    println!("📝 File modification detected");
-                    let contents = tokio::fs::read_to_string(&file_path).await?;
-                    println!("📖 Read file contents (length={})", contents.len());
-                    protocol.update_doc(&contents);
-                }
-                _ => {
-                    // Ignoring other watcher events
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     let mut tasks = JoinSet::new();
 
     let iroh = match opts {
@@ -175,6 +91,90 @@ async fn main() -> anyhow::Result<()> {
     iroh.shutdown().await?;
     tasks.shutdown().await;
     println!("shut down gracefully");
+
+    Ok(())
+}
+
+// Common setup function for both Serve and Join modes
+async fn setup_node(
+    doc: loro::LoroDoc,
+    file_path: String,
+    key_path: Option<&str>,
+    tasks: &mut JoinSet<()>,
+) -> anyhow::Result<(IrohLoroProtocol, iroh::protocol::Router)> {
+    let secret_key = if let Some(key_path) = key_path {
+        iroh_node_util::fs::load_secret_key(
+            dirs_next::cache_dir()
+                .context("no dir for secret key")?
+                .join("iroh-loro")
+                .join(key_path),
+        )
+        .await?
+    } else {
+        iroh::SecretKey::generate(rand::rngs::OsRng)
+    };
+
+    let (tx, mut rx) = mpsc::channel(100);
+    let protocol = IrohLoroProtocol::new(doc, tx);
+
+    // Spawn file writer task
+    tasks.spawn(async move {
+        while let Some(contents) = rx.recv().await {
+            println!("💾 Writing new contents to file. Length={}", contents.len());
+            match tokio::fs::write(&file_path, contents).await {
+                Ok(_) => println!("✅ Successfully wrote to file"),
+                Err(e) => println!("❌ Failed to write to file: {}", e),
+            }
+        }
+    });
+
+    let endpoint = iroh::Endpoint::builder()
+        .discovery_n0()
+        .secret_key(secret_key)
+        .bind()
+        .await?;
+
+    // Create and configure iroh node
+    let iroh = iroh::protocol::Router::builder(endpoint)
+        .accept(IrohLoroProtocol::ALPN, protocol.clone())
+        .spawn()
+        .await?;
+
+    let addr = iroh.endpoint().node_addr().await?;
+    println!("Running\nNode Id: {}", addr.node_id);
+
+    Ok((protocol, iroh))
+}
+
+// File watcher for watching given file path that updates the loro doc when it changes
+async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()> {
+    println!("👀 Starting file watcher for: {}", file_path);
+    let (notify_tx, mut notify_rx) = mpsc::channel(10);
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = notify_tx.blocking_send(res); // ignore when the rx is dropped
+    })?;
+
+    watcher.watch(
+        std::path::Path::new(&file_path),
+        notify::RecursiveMode::NonRecursive,
+    )?;
+
+    while let Some(res) = notify_rx.recv().await {
+        match res? {
+            notify::Event {
+                kind: notify::EventKind::Modify(_),
+                ..
+            } => {
+                println!("📝 File modification detected");
+                let contents = tokio::fs::read_to_string(&file_path).await?;
+                println!("📖 Read file contents (length={})", contents.len());
+                protocol.update_doc(&contents);
+            }
+            _ => {
+                // Ignoring other watcher events
+            }
+        }
+    }
 
     Ok(())
 }
