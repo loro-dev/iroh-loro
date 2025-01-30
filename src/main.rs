@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
 
             let doc = loro::LoroDoc::new();
             doc.get_text("text")
-                .update(&contents, loro::UpdateOptions::default())?;
+                .update_by_line(&contents, loro::UpdateOptions::default())?;
             doc.commit();
 
             println!("Serving file: {}", file_path);
@@ -88,12 +88,22 @@ async fn main() -> Result<()> {
 
     // Wait for Ctrl+C
     signal::ctrl_c().await?;
-    println!("Received Ctrl+C, shutting down...");
-    iroh.shutdown().await?;
-    tasks.shutdown().await;
-    println!("shut down gracefully");
 
-    Ok(())
+    n0_future::future::race(
+        async move {
+            println!("Received Ctrl+C, shutting down...");
+            iroh.shutdown().await?;
+            tasks.shutdown().await;
+            println!("shut down gracefully");
+            Ok(())
+        },
+        async {
+            signal::ctrl_c().await?;
+            println!("Another Ctrl+C detected, forcefully shutting down...");
+            std::process::exit(1);
+        },
+    )
+    .await
 }
 
 // Common protocol setup function for both Serve and Join modes
@@ -176,7 +186,7 @@ async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()
                 println!("📝 File modification detected");
                 let contents = tokio::fs::read_to_string(&file_path).await?;
                 println!("📖 Read file contents (length={})", contents.len());
-                protocol.update_doc(&contents);
+                protocol.update_doc(&contents)?;
             }
             _ => {
                 // Ignoring other watcher events

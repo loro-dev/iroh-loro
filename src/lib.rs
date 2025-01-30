@@ -1,8 +1,8 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::Result;
-use iroh::protocol::ProtocolHandler;
-use loro::{ExportMode, LoroDoc};
+use iroh::{endpoint::RecvStream, protocol::ProtocolHandler};
+use loro::{ExportMode, LoroDoc, UpdateOptions};
 use n0_future::{FuturesUnorderedBounded, StreamExt};
 use tokio::{select, sync::mpsc};
 
@@ -22,17 +22,22 @@ impl IrohLoroProtocol {
         }
     }
 
-    pub fn update_doc(&self, new_doc: &str) {
+    pub fn update_doc(&self, new_doc: &str) -> Result<()> {
         println!(
             "📝 Local file changed. Updating doc... (length={})",
             new_doc.len()
         );
-        self.doc
-            .get_text("text")
-            .update(new_doc, loro::UpdateOptions::default())
-            .unwrap();
+        let mut opts = UpdateOptions::default();
+        if new_doc.len() > 50_000 {
+            opts.use_refined_diff = false;
+            self.doc.get_text("text").update_by_line(new_doc, opts)?;
+        } else {
+            self.doc.get_text("text").update(new_doc, opts)?;
+        }
         self.doc.commit();
         println!("✅ Local update committed");
+
+        Ok(())
     }
 
     pub async fn initiate_sync(&self, conn: iroh::endpoint::Connection) -> Result<()> {
@@ -61,25 +66,8 @@ impl IrohLoroProtocol {
                 },
                 // Accept incoming messages via uni-direction streams, if we have capacities to handle them
                 stream = conn.accept_uni(), if running_syncs.len() < running_syncs.capacity() => {
-                    let mut stream = stream?;
-                    let push_result = running_syncs.try_push(async move {
-                        let msg = stream.read_to_end(10_000).await?; // 10 KB limit for now
-
-                        println!("📥 Received sync message from peer (size={})", msg.len());
-                        if let Err(e) = self.doc.import(&msg) {
-                            println!("❌ Failed to import sync message: {}", e);
-                        };
-                        println!("✅ Successfully imported sync message");
-
-                        self.sender.send(self.doc.get_text("text").to_string()).await?;
-
-                        println!("✅ Successfully sent update to local");
-
-                        anyhow::Ok(())
-                    });
-                    if push_result.is_err() {
-                        eprintln!("Cannot start sync - already have too many concurrent syncs running");
-                    }
+                    // capacity checked in precondition above
+                    running_syncs.push(self.handle_sync_message(stream?));
                 },
                 // Work on current syncs
                 Some(result) = running_syncs.next() => {
@@ -98,6 +86,24 @@ impl IrohLoroProtocol {
                 }
             }
         }
+    }
+
+    async fn handle_sync_message(&self, mut stream: RecvStream) -> Result<()> {
+        let msg = stream.read_to_end(10_000_000).await?; // 10 MB limit for now
+
+        println!("📥 Received sync message from peer (size={})", msg.len());
+        if let Err(e) = self.doc.import(&msg) {
+            println!("❌ Failed to import sync message: {}", e);
+        };
+        println!("✅ Successfully imported sync message");
+
+        self.sender
+            .send(self.doc.get_text("text").to_string())
+            .await?;
+
+        println!("✅ Successfully sent update to local");
+
+        Ok(())
     }
 
     pub async fn respond_sync(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
