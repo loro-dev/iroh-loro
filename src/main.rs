@@ -19,7 +19,7 @@ enum Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     let opts = Cli::parse();
 
     let mut tasks = JoinSet::new();
@@ -36,8 +36,8 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Serving file: {}", file_path);
 
-            let (protocol, iroh) =
-                setup_node(doc, file_path.clone(), Some("key.ed25519"), &mut tasks).await?;
+            let protocol = setup_protocol(doc, file_path.clone(), &mut tasks).await?;
+            let iroh = setup_node(protocol.clone(), Some("key.ed25519")).await?;
 
             tasks.spawn(async move {
                 if let Err(e) = watch_files(file_path, protocol).await {
@@ -58,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
                 println!("Created new file at: {file_path}");
             }
 
-            let (protocol, iroh) = setup_node(doc, file_path.clone(), None, &mut tasks).await?;
+            let protocol = setup_protocol(doc, file_path.clone(), &mut tasks).await?;
+            let iroh = setup_node(protocol.clone(), None).await?;
 
             tasks.spawn({
                 let protocol = protocol.clone();
@@ -95,25 +96,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Common setup function for both Serve and Join modes
-async fn setup_node(
+// Common protocol setup function for both Serve and Join modes
+async fn setup_protocol(
     doc: loro::LoroDoc,
     file_path: String,
-    key_path: Option<&str>,
     tasks: &mut JoinSet<()>,
-) -> anyhow::Result<(IrohLoroProtocol, iroh::protocol::Router)> {
-    let secret_key = if let Some(key_path) = key_path {
-        iroh_node_util::fs::load_secret_key(
-            dirs_next::cache_dir()
-                .context("no dir for secret key")?
-                .join("iroh-loro")
-                .join(key_path),
-        )
-        .await?
-    } else {
-        iroh::SecretKey::generate(rand::rngs::OsRng)
-    };
-
+) -> Result<IrohLoroProtocol> {
     let (tx, mut rx) = mpsc::channel(100);
     let protocol = IrohLoroProtocol::new(doc, tx);
 
@@ -128,6 +116,26 @@ async fn setup_node(
         }
     });
 
+    Ok(protocol)
+}
+
+// Common setup function for both Serve and Join modes
+async fn setup_node(
+    protocol: IrohLoroProtocol,
+    key_path: Option<&str>,
+) -> Result<iroh::protocol::Router> {
+    let secret_key = if let Some(key_path) = key_path {
+        iroh_node_util::fs::load_secret_key(
+            dirs_next::cache_dir()
+                .context("no dir for secret key")?
+                .join("iroh-loro")
+                .join(key_path),
+        )
+        .await?
+    } else {
+        iroh::SecretKey::generate(rand::rngs::OsRng)
+    };
+
     let endpoint = iroh::Endpoint::builder()
         .discovery_n0()
         .secret_key(secret_key)
@@ -136,14 +144,14 @@ async fn setup_node(
 
     // Create and configure iroh node
     let iroh = iroh::protocol::Router::builder(endpoint)
-        .accept(IrohLoroProtocol::ALPN, protocol.clone())
+        .accept(IrohLoroProtocol::ALPN, protocol)
         .spawn()
         .await?;
 
     let addr = iroh.endpoint().node_addr().await?;
     println!("Running\nNode Id: {}", addr.node_id);
 
-    Ok((protocol, iroh))
+    Ok(iroh)
 }
 
 // File watcher for watching given file path that updates the loro doc when it changes
