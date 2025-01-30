@@ -81,34 +81,40 @@ async fn main() -> anyhow::Result<()> {
         protocol: IrohLoroProtocol,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            println!("👀 Starting file watcher for: {}", file_path);
-            let (notify_tx, mut notify_rx) = mpsc::channel(1);
-            let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-                if let Ok(event) = res {
-                    if let notify::EventKind::Modify(_) = event.kind {
-                        println!("📝 File modification detected");
-                        let _ = notify_tx.blocking_send(());
-                    }
-                }
-            })
-            .unwrap();
-            watcher
-                .watch(
+            let result = async move {
+                println!("👀 Starting file watcher for: {}", file_path);
+                let (notify_tx, mut notify_rx) = mpsc::channel(10);
+                let mut watcher = notify::recommended_watcher(move |res| {
+                    let _ = notify_tx.blocking_send(res); // ignore when the rx is dropped
+                })?;
+
+                watcher.watch(
                     std::path::Path::new(&file_path),
                     notify::RecursiveMode::NonRecursive,
-                )
-                .unwrap();
+                )?;
 
-            loop {
-                if let Some(_) = notify_rx.recv().await {
-                    match std::fs::read_to_string(&file_path) {
-                        Ok(contents) => {
+                while let Some(res) = notify_rx.recv().await {
+                    match res? {
+                        notify::Event {
+                            kind: notify::EventKind::Modify(_),
+                            ..
+                        } => {
+                            println!("📝 File modification detected");
+                            let contents = tokio::fs::read_to_string(&file_path).await?;
                             println!("📖 Read file contents (length={})", contents.len());
                             protocol.update_doc(&contents);
                         }
-                        Err(e) => println!("❌ Failed to read file: {}", e),
+                        _ => {
+                            // Ignoring other watcher events
+                        }
                     }
                 }
+
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                println!("❌ File watcher task failed: {e}");
             }
         })
     }
@@ -127,11 +133,12 @@ async fn main() -> anyhow::Result<()> {
 
             let (p, iroh, _writer) =
                 setup_node(doc, file_path.clone(), Some("key.ed25519")).await?;
-            let _watcher = spawn_file_watcher(file_path, p);
+            let watcher = spawn_file_watcher(file_path, p);
 
             // Wait for Ctrl+C
             signal::ctrl_c().await?;
             println!("Received Ctrl+C, shutting down...");
+            watcher.abort();
             iroh.shutdown().await?;
         }
 
@@ -145,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Created new file at: {}", file_path);
             }
             let (protocol, iroh, _writer) = setup_node(doc, file_path.clone(), None).await?;
-            let _watcher = spawn_file_watcher(file_path, protocol.clone());
+            let watcher = spawn_file_watcher(file_path, protocol.clone());
 
             // Connect to remote node and sync
             let node_addr = iroh::NodeAddr::new(remote_id);
@@ -159,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
             // Wait for Ctrl+C
             signal::ctrl_c().await?;
             println!("Received Ctrl+C, shutting down...");
+            watcher.abort();
             iroh.shutdown().await?;
         }
     }
