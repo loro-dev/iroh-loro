@@ -1,9 +1,10 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use clap::{Parser, command};
 use iroh_loro::IrohLoroProtocol;
 use notify::Watcher;
 use tokio::signal;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -26,11 +27,8 @@ async fn main() -> anyhow::Result<()> {
         doc: loro::LoroDoc,
         file_path: String,
         key_path: Option<&str>,
-    ) -> anyhow::Result<(
-        IrohLoroProtocol,
-        iroh::protocol::Router,
-        tokio::task::JoinHandle<()>,
-    )> {
+        tasks: &mut JoinSet<()>,
+    ) -> anyhow::Result<(IrohLoroProtocol, iroh::protocol::Router)> {
         let secret_key = if let Some(key_path) = key_path {
             iroh_node_util::fs::load_secret_key(
                 dirs_next::cache_dir()
@@ -47,10 +45,10 @@ async fn main() -> anyhow::Result<()> {
         let protocol = IrohLoroProtocol::new(doc, tx);
 
         // Spawn file writer task
-        let writer_handle = tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some(contents) = rx.recv().await {
                 println!("💾 Writing new contents to file. Length={}", contents.len());
-                match std::fs::write(&file_path, contents) {
+                match tokio::fs::write(&file_path, contents).await {
                     Ok(_) => println!("✅ Successfully wrote to file"),
                     Err(e) => println!("❌ Failed to write to file: {}", e),
                 }
@@ -72,74 +70,66 @@ async fn main() -> anyhow::Result<()> {
         let addr = iroh.endpoint().node_addr().await?;
         println!("Running\nNode Id: {}", addr.node_id);
 
-        Ok((protocol, iroh, writer_handle))
+        Ok((protocol, iroh))
     }
 
-    // Modified file watcher setup to return the JoinHandle
-    fn spawn_file_watcher(
-        file_path: String,
-        protocol: IrohLoroProtocol,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let result = async move {
-                println!("👀 Starting file watcher for: {}", file_path);
-                let (notify_tx, mut notify_rx) = mpsc::channel(10);
-                let mut watcher = notify::recommended_watcher(move |res| {
-                    let _ = notify_tx.blocking_send(res); // ignore when the rx is dropped
-                })?;
+    // File watcher for watching given file path that updates the loro doc when it changes
+    async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()> {
+        println!("👀 Starting file watcher for: {}", file_path);
+        let (notify_tx, mut notify_rx) = mpsc::channel(10);
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = notify_tx.blocking_send(res); // ignore when the rx is dropped
+        })?;
 
-                watcher.watch(
-                    std::path::Path::new(&file_path),
-                    notify::RecursiveMode::NonRecursive,
-                )?;
+        watcher.watch(
+            std::path::Path::new(&file_path),
+            notify::RecursiveMode::NonRecursive,
+        )?;
 
-                while let Some(res) = notify_rx.recv().await {
-                    match res? {
-                        notify::Event {
-                            kind: notify::EventKind::Modify(_),
-                            ..
-                        } => {
-                            println!("📝 File modification detected");
-                            let contents = tokio::fs::read_to_string(&file_path).await?;
-                            println!("📖 Read file contents (length={})", contents.len());
-                            protocol.update_doc(&contents);
-                        }
-                        _ => {
-                            // Ignoring other watcher events
-                        }
-                    }
+        while let Some(res) = notify_rx.recv().await {
+            match res? {
+                notify::Event {
+                    kind: notify::EventKind::Modify(_),
+                    ..
+                } => {
+                    println!("📝 File modification detected");
+                    let contents = tokio::fs::read_to_string(&file_path).await?;
+                    println!("📖 Read file contents (length={})", contents.len());
+                    protocol.update_doc(&contents);
                 }
+                _ => {
+                    // Ignoring other watcher events
+                }
+            }
+        }
 
-                anyhow::Ok(())
-            }
-            .await;
-            if let Err(e) = result {
-                println!("❌ File watcher task failed: {e}");
-            }
-        })
+        Ok(())
     }
 
-    match opts {
+    let mut tasks = JoinSet::new();
+
+    let iroh = match opts {
         Cli::Serve { file_path } => {
             // Initialize document with file contents
-            let contents = std::fs::read_to_string(&file_path)
-                .expect("Should have been able to read the file");
+            let contents = tokio::fs::read_to_string(&file_path).await?;
+
             let doc = loro::LoroDoc::new();
             doc.get_text("text")
-                .update(&contents, loro::UpdateOptions::default())
-                .unwrap();
+                .update(&contents, loro::UpdateOptions::default())?;
             doc.commit();
+
             println!("Serving file: {}", file_path);
 
-            let (p, iroh, _writer) =
-                setup_node(doc, file_path.clone(), Some("key.ed25519")).await?;
-            let watcher = spawn_file_watcher(file_path, p);
+            let (protocol, iroh) =
+                setup_node(doc, file_path.clone(), Some("key.ed25519"), &mut tasks).await?;
 
-            // Wait for Ctrl+C
-            signal::ctrl_c().await?;
-            println!("Received Ctrl+C, shutting down...");
-            watcher.abort();
-            iroh.shutdown().await?;
+            tasks.spawn(async move {
+                if let Err(e) = watch_files(file_path, protocol).await {
+                    println!("❌ File watcher task failed: {e}");
+                }
+            });
+
+            iroh
         }
 
         Cli::Join {
@@ -148,28 +138,43 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let doc = loro::LoroDoc::new();
             if !std::path::Path::new(&file_path).exists() {
-                std::fs::write(&file_path, "").unwrap();
-                println!("Created new file at: {}", file_path);
+                tokio::fs::write(&file_path, "").await?;
+                println!("Created new file at: {file_path}");
             }
-            let (protocol, iroh, _writer) = setup_node(doc, file_path.clone(), None).await?;
-            let watcher = spawn_file_watcher(file_path, protocol.clone());
+
+            let (protocol, iroh) = setup_node(doc, file_path.clone(), None, &mut tasks).await?;
+
+            tasks.spawn({
+                let protocol = protocol.clone();
+                async move {
+                    if let Err(e) = watch_files(file_path, protocol).await {
+                        println!("❌ File watcher task failed: {e}");
+                    }
+                }
+            });
 
             // Connect to remote node and sync
-            let node_addr = iroh::NodeAddr::new(remote_id);
             let conn = iroh
                 .endpoint()
-                .connect(node_addr, IrohLoroProtocol::ALPN)
+                .connect(remote_id, IrohLoroProtocol::ALPN)
                 .await?;
 
-            protocol.inner.initiate_sync(conn).await?;
+            tasks.spawn(async move {
+                if let Err(e) = protocol.initiate_sync(conn).await {
+                    println!("Sync protocol failed: {e}");
+                }
+            });
 
-            // Wait for Ctrl+C
-            signal::ctrl_c().await?;
-            println!("Received Ctrl+C, shutting down...");
-            watcher.abort();
-            iroh.shutdown().await?;
+            iroh
         }
-    }
+    };
+
+    // Wait for Ctrl+C
+    signal::ctrl_c().await?;
+    println!("Received Ctrl+C, shutting down...");
+    iroh.shutdown().await?;
+    tasks.shutdown().await;
+    println!("shut down gracefully");
 
     Ok(())
 }

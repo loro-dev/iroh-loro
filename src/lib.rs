@@ -8,7 +8,8 @@ use tokio::{select, sync::mpsc};
 
 #[derive(Debug, Clone)]
 pub struct IrohLoroProtocol {
-    pub inner: Arc<Inner>,
+    doc: Arc<LoroDoc>,
+    sender: mpsc::Sender<String>,
 }
 
 impl IrohLoroProtocol {
@@ -16,24 +17,9 @@ impl IrohLoroProtocol {
 
     pub fn new(doc: LoroDoc, sender: mpsc::Sender<String>) -> Self {
         Self {
-            inner: Arc::new(Inner::new(doc, sender)),
+            doc: Arc::new(doc),
+            sender,
         }
-    }
-
-    pub fn update_doc(&self, new_doc: &str) {
-        self.inner.update_doc(new_doc)
-    }
-}
-
-#[derive(Debug)]
-pub struct Inner {
-    doc: LoroDoc,
-    sender: mpsc::Sender<String>,
-}
-
-impl Inner {
-    pub fn new(doc: LoroDoc, sender: mpsc::Sender<String>) -> Self {
-        Self { doc, sender }
     }
 
     pub fn update_doc(&self, new_doc: &str) {
@@ -125,18 +111,16 @@ impl ProtocolHandler for IrohLoroProtocol {
         &self,
         conn: iroh::endpoint::Connecting,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
-        Box::pin({
-            let inner = Arc::clone(&self.inner);
-            async move {
-                println!("🔌 Peer connected");
-                let result = inner.respond_sync(conn).await;
-                println!("🔌 Peer disconnected");
-                if let Err(e) = result {
-                    println!("❌ Error: {}", e);
-                    return Err(e);
-                }
-                Ok(())
+        let this = self.clone();
+        Box::pin(async move {
+            println!("🔌 Peer connected");
+            let result = this.respond_sync(conn).await;
+            println!("🔌 Peer disconnected");
+            if let Err(e) = result {
+                println!("❌ Error: {}", e);
+                return Err(e);
             }
+            Ok(())
         })
     }
 }
