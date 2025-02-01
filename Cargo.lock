@@ -2071,6 +2071,7 @@ dependencies = [
  "postcard",
  "rand",
  "serde",
+ "serde_bytes",
  "tokio",
  "tracing",
  "tracing-subscriber",
