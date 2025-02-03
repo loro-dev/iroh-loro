@@ -53,7 +53,9 @@ impl IrohLoroProtocol {
                 SyncMode::Continuous => false.into(),
                 SyncMode::Once => true.into(),
             },
-            remote_vv: Mutex::new(VersionVector::new()),
+            remote: Mutex::new(RemoteState {
+                vv: VersionVector::new(),
+            }),
         };
         // Do two things simultaneously:
         // 1. send our version vector
@@ -90,7 +92,11 @@ struct SyncSession {
     doc: LoroDoc,
     conn: iroh::endpoint::Connection,
     close_when_done: AtomicBool,
-    remote_vv: Mutex<VersionVector>,
+    remote: Mutex<RemoteState>,
+}
+
+struct RemoteState {
+    vv: VersionVector,
 }
 
 impl SyncSession {
@@ -158,8 +164,8 @@ impl SyncSession {
         );
 
         if let Some(vv) = &message.version_vector {
-            let mut remote_vv = self.remote_vv.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
-            remote_vv.extend_to_include_vv(vv.iter());
+            let mut remote = self.remote.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
+            remote.vv.extend_to_include_vv(vv.iter());
         }
 
         if let Some(diff) = message.diff {
@@ -193,14 +199,14 @@ impl SyncSession {
     fn update_if_needed(&self) -> Result<Option<Message<'static>>> {
         let close_when_done = self.close_when_done.load(atomic::Ordering::Relaxed);
         let our_vv = self.doc.oplog_vv();
-        let mut remote_vv = self.remote_vv.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
-        Ok(match our_vv.partial_cmp(&remote_vv) {
+        let mut remote = self.remote.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
+        Ok(match our_vv.partial_cmp(&remote.vv) {
             None => {
                 // We diverged: Send a diff and request to get a diff back, too
                 println!("⛓️‍💥 We are diverged");
-                let diff = self.doc.export(ExportMode::updates(&remote_vv))?;
+                let diff = self.doc.export(ExportMode::updates(&remote.vv))?;
                 // We assume that the remote will eventually receive our message and be on our state
-                remote_vv.extend_to_include_vv(our_vv.iter());
+                remote.vv.extend_to_include_vv(our_vv.iter());
                 Some(Message {
                     version_vector: Some(our_vv),
                     close_when_done,
@@ -210,9 +216,9 @@ impl SyncSession {
             Some(Ordering::Greater) => {
                 // We're ahead: Send a diff, but no need to tell the other side to update us
                 println!("📈 We are ahead");
-                let diff = self.doc.export(ExportMode::updates(&remote_vv))?;
+                let diff = self.doc.export(ExportMode::updates(&remote.vv))?;
                 // We assume that the remote will eventually receive our message and be on our state
-                remote_vv.extend_to_include_vv(our_vv.iter());
+                remote.vv.extend_to_include_vv(our_vv.iter());
                 println!("🤝 Assuming to be in sync once peer receives this");
                 Some(Message {
                     version_vector: None,
