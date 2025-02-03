@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, command};
-use iroh_loro::IrohLoroProtocol;
+use iroh_loro::{IrohLoroProtocol, SyncMode};
 use notify::Watcher;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -15,10 +15,6 @@ enum Cli {
         file_path: String,
     },
     Join {
-        remote_id: iroh::NodeId,
-        file_path: String,
-    },
-    SyncOnce {
         remote_id: iroh::NodeId,
         file_path: String,
     },
@@ -65,33 +61,7 @@ async fn main() -> Result<()> {
                 .await?;
 
             tasks.spawn(async move {
-                if let Err(e) = protocol.initiate_sync(conn, true).await {
-                    println!("Sync protocol failed: {e}");
-                }
-            });
-
-            (iroh, file_path)
-        }
-
-        Cli::SyncOnce {
-            remote_id,
-            file_path,
-        } => {
-            if !std::path::Path::new(&file_path).exists() {
-                tokio::fs::write(&file_path, "").await?;
-                println!("Created new file at: {file_path}");
-            }
-
-            let iroh = setup_node(protocol.clone(), None).await?;
-
-            // Connect to remote node and sync
-            let conn = iroh
-                .endpoint()
-                .connect(remote_id, IrohLoroProtocol::ALPN)
-                .await?;
-
-            tasks.spawn(async move {
-                if let Err(e) = protocol.initiate_sync(conn, false).await {
+                if let Err(e) = protocol.initiate_sync(conn, SyncMode::Continuous).await {
                     println!("Sync protocol failed: {e}");
                 }
             });
@@ -140,30 +110,6 @@ async fn main() -> Result<()> {
     .await
 }
 
-// Common protocol setup function for both Serve and Join modes
-async fn write_txt_changes_to_file(doc: loro::LoroDoc, file_path: String) -> Result<()> {
-    // This will the data we're working on
-    let txt = doc.get_text("text");
-    let (tx, mut rx) = mpsc::channel(100);
-    let callback: loro::event::Subscriber = Arc::new({
-        let txt = txt.clone();
-        move |_event| {
-            let _ignore = tx.try_send(txt.to_string());
-        }
-    });
-    let _sub = doc.subscribe(&txt.id(), callback);
-
-    while let Some(contents) = rx.recv().await {
-        println!("💾 Writing new contents to file. Length={}", contents.len());
-        match tokio::fs::write(&file_path, contents).await {
-            Ok(_) => println!("✅ Successfully wrote to file"),
-            Err(e) => println!("❌ Failed to write to file: {}", e),
-        }
-    }
-
-    Ok(())
-}
-
 // Common setup function for both Serve and Join modes
 async fn setup_node(
     protocol: IrohLoroProtocol,
@@ -197,6 +143,30 @@ async fn setup_node(
     println!("Running\nNode Id: {}", addr.node_id);
 
     Ok(iroh)
+}
+
+// Common protocol setup function for both Serve and Join modes
+async fn write_txt_changes_to_file(doc: loro::LoroDoc, file_path: String) -> Result<()> {
+    // This will the data we're working on
+    let txt = doc.get_text("text");
+    let (tx, mut rx) = mpsc::channel(100);
+    let callback: loro::event::Subscriber = Arc::new({
+        let txt = txt.clone();
+        move |_event| {
+            let _ignore = tx.try_send(txt.to_string());
+        }
+    });
+    let _sub = doc.subscribe(&txt.id(), callback);
+
+    while let Some(contents) = rx.recv().await {
+        println!("💾 Writing new contents to file. Length={}", contents.len());
+        match tokio::fs::write(&file_path, contents).await {
+            Ok(_) => println!("✅ Successfully wrote to file"),
+            Err(e) => println!("❌ Failed to write to file: {}", e),
+        }
+    }
+
+    Ok(())
 }
 
 // File watcher for watching given file path that updates the loro doc when it changes

@@ -20,6 +20,12 @@ pub struct IrohLoroProtocol {
     doc: LoroDoc,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum SyncMode {
+    Continuous,
+    Once,
+}
+
 impl IrohLoroProtocol {
     pub const ALPN: &'static [u8] = b"iroh/loro/1";
 
@@ -34,7 +40,7 @@ impl IrohLoroProtocol {
     pub async fn initiate_sync(
         &self,
         conn: iroh::endpoint::Connection,
-        continuous: bool,
+        mode: SyncMode,
     ) -> Result<()> {
         let vv_msg = Message {
             version_vector: Some(self.doc.oplog_vv()),
@@ -43,7 +49,10 @@ impl IrohLoroProtocol {
         let session = SyncSession {
             conn: conn.clone(),
             doc: self.doc.clone(),
-            close_when_done: (!continuous).into(),
+            close_when_done: match mode {
+                SyncMode::Continuous => false.into(),
+                SyncMode::Once => true.into(),
+            },
             remote_vv: Mutex::new(VersionVector::new()),
         };
         // Do two things simultaneously:
@@ -55,7 +64,7 @@ impl IrohLoroProtocol {
 
     pub async fn respond_sync(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
         let conn = conn.await?;
-        self.initiate_sync(conn, true).await
+        self.initiate_sync(conn, SyncMode::Continuous).await
     }
 }
 
