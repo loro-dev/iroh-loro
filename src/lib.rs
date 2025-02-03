@@ -1,4 +1,13 @@
-use std::{borrow::Cow, cmp::Ordering, future::Future, pin::Pin, sync::Mutex};
+use std::{
+    borrow::Cow,
+    cmp::Ordering,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Mutex,
+        atomic::{self, AtomicBool},
+    },
+};
 
 use anyhow::Result;
 use iroh::{endpoint::RecvStream, protocol::ProtocolHandler};
@@ -22,14 +31,19 @@ impl IrohLoroProtocol {
         &self.doc
     }
 
-    pub async fn initiate_sync(&self, conn: iroh::endpoint::Connection) -> Result<()> {
+    pub async fn initiate_sync(
+        &self,
+        conn: iroh::endpoint::Connection,
+        continuous: bool,
+    ) -> Result<()> {
         let vv_msg = Message {
             version_vector: Some(self.doc.oplog_vv()),
-            diff: None,
+            ..Message::default()
         };
         let session = SyncSession {
             conn: conn.clone(),
             doc: self.doc.clone(),
+            close_when_done: (!continuous).into(),
             remote_vv: Mutex::new(VersionVector::new()),
         };
         // Do two things simultaneously:
@@ -41,7 +55,7 @@ impl IrohLoroProtocol {
 
     pub async fn respond_sync(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
         let conn = conn.await?;
-        self.initiate_sync(conn).await
+        self.initiate_sync(conn, true).await
     }
 }
 
@@ -66,6 +80,7 @@ impl ProtocolHandler for IrohLoroProtocol {
 struct SyncSession {
     doc: LoroDoc,
     conn: iroh::endpoint::Connection,
+    close_when_done: AtomicBool,
     remote_vv: Mutex<VersionVector>,
 }
 
@@ -116,8 +131,8 @@ impl SyncSession {
                 msg = rx.recv(), if has_capacity(&pending_send) => {
                     // capacity checked in precondition above
                     pending_send.push(self.send(Message {
-                        version_vector: None,
-                        diff: Some(Diff { bytes: msg?.into() })
+                        diff: Some(Diff { bytes: msg?.into() }),
+                        ..Message::default()
                     }));
                 }
             }
@@ -147,6 +162,9 @@ impl SyncSession {
             );
         }
 
+        self.close_when_done
+            .fetch_or(message.close_when_done, atomic::Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -164,6 +182,7 @@ impl SyncSession {
     }
 
     fn update_if_needed(&self) -> Result<Option<Message<'static>>> {
+        let close_when_done = self.close_when_done.load(atomic::Ordering::Relaxed);
         let our_vv = self.doc.oplog_vv();
         let mut remote_vv = self.remote_vv.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
         Ok(match our_vv.partial_cmp(&remote_vv) {
@@ -175,6 +194,7 @@ impl SyncSession {
                 remote_vv.extend_to_include_vv(our_vv.iter());
                 Some(Message {
                     version_vector: Some(our_vv),
+                    close_when_done,
                     diff: Some(Diff { bytes: diff.into() }),
                 })
             }
@@ -187,6 +207,7 @@ impl SyncSession {
                 println!("🤝 Assuming to be in sync once peer receives this");
                 Some(Message {
                     version_vector: None,
+                    close_when_done,
                     diff: Some(Diff { bytes: diff.into() }),
                 })
             }
@@ -195,11 +216,15 @@ impl SyncSession {
                 println!("📉 We are behind");
                 Some(Message {
                     version_vector: Some(our_vv),
+                    close_when_done,
                     diff: None,
                 })
             }
             Some(Ordering::Equal) => {
                 println!("🤝 In sync with peer");
+                if close_when_done {
+                    self.conn.close(0u32.into(), b"in sync, thank you");
+                }
                 None
             }
         })
@@ -210,9 +235,10 @@ fn has_capacity<F>(tasks: &FuturesUnorderedBounded<F>) -> bool {
     tasks.len() < tasks.capacity()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct Message<'a> {
     version_vector: Option<VersionVector>,
+    close_when_done: bool,
     #[serde(borrow)]
     diff: Option<Diff<'a>>,
 }

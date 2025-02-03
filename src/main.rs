@@ -18,6 +18,10 @@ enum Cli {
         remote_id: iroh::NodeId,
         file_path: String,
     },
+    SyncOnce {
+        remote_id: iroh::NodeId,
+        file_path: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -61,7 +65,33 @@ async fn main() -> Result<()> {
                 .await?;
 
             tasks.spawn(async move {
-                if let Err(e) = protocol.initiate_sync(conn).await {
+                if let Err(e) = protocol.initiate_sync(conn, true).await {
+                    println!("Sync protocol failed: {e}");
+                }
+            });
+
+            (iroh, file_path)
+        }
+
+        Cli::SyncOnce {
+            remote_id,
+            file_path,
+        } => {
+            if !std::path::Path::new(&file_path).exists() {
+                tokio::fs::write(&file_path, "").await?;
+                println!("Created new file at: {file_path}");
+            }
+
+            let iroh = setup_node(protocol.clone(), None).await?;
+
+            // Connect to remote node and sync
+            let conn = iroh
+                .endpoint()
+                .connect(remote_id, IrohLoroProtocol::ALPN)
+                .await?;
+
+            tasks.spawn(async move {
+                if let Err(e) = protocol.initiate_sync(conn, false).await {
                     println!("Sync protocol failed: {e}");
                 }
             });
