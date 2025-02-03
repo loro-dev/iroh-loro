@@ -24,7 +24,7 @@ impl IrohLoroProtocol {
 
     pub async fn initiate_sync(&self, conn: iroh::endpoint::Connection) -> Result<()> {
         let vv_msg = Message {
-            version_vector: self.doc.oplog_vv(),
+            version_vector: Some(self.doc.oplog_vv()),
             diff: None,
         };
         let session = SyncSession {
@@ -116,7 +116,7 @@ impl SyncSession {
                 msg = rx.recv(), if has_capacity(&pending_send) => {
                     // capacity checked in precondition above
                     pending_send.push(self.send(Message {
-                        version_vector: self.doc.oplog_vv(),
+                        version_vector: None,
                         diff: Some(Diff { bytes: msg?.into() })
                     }));
                 }
@@ -133,8 +133,10 @@ impl SyncSession {
             message.diff.is_some()
         );
 
-        let mut remote_vv = self.remote_vv.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
-        remote_vv.extend_to_include_vv(message.version_vector.iter());
+        if let Some(vv) = &message.version_vector {
+            let mut remote_vv = self.remote_vv.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
+            remote_vv.extend_to_include_vv(vv.iter());
+        }
 
         if let Some(diff) = message.diff {
             let status = self.doc.import(diff.as_ref())?;
@@ -172,7 +174,7 @@ impl SyncSession {
                 // We assume that the remote will eventually receive our message and be on our state
                 remote_vv.extend_to_include_vv(our_vv.iter());
                 Some(Message {
-                    version_vector: our_vv,
+                    version_vector: Some(our_vv),
                     diff: Some(Diff { bytes: diff.into() }),
                 })
             }
@@ -182,8 +184,9 @@ impl SyncSession {
                 let diff = self.doc.export(ExportMode::updates(&remote_vv))?;
                 // We assume that the remote will eventually receive our message and be on our state
                 remote_vv.extend_to_include_vv(our_vv.iter());
+                println!("🤝 Assuming to be in sync once peer receives this");
                 Some(Message {
-                    version_vector: our_vv,
+                    version_vector: None,
                     diff: Some(Diff { bytes: diff.into() }),
                 })
             }
@@ -191,7 +194,7 @@ impl SyncSession {
                 // We are behind: we inform the other side about what we're missing, apparently we didn't get it
                 println!("📉 We are behind");
                 Some(Message {
-                    version_vector: our_vv,
+                    version_vector: Some(our_vv),
                     diff: None,
                 })
             }
@@ -209,7 +212,7 @@ fn has_capacity<F>(tasks: &FuturesUnorderedBounded<F>) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Message<'a> {
-    version_vector: VersionVector,
+    version_vector: Option<VersionVector>,
     #[serde(borrow)]
     diff: Option<Diff<'a>>,
 }
