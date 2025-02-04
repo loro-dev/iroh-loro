@@ -2072,6 +2072,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_bytes",
+ "testresult",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4659,6 +4660,12 @@ dependencies = [
  "rustix",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "testresult"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "614b328ff036a4ef882c61570f72918f7e9c5bee1da33f8e7f91e01daee7e56c"
 
 [[package]]
 name = "thiserror"

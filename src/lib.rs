@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{self, AtomicBool},
-        Mutex,
+        Arc, Mutex,
     },
 };
 
@@ -17,7 +17,7 @@ use iroh::{
 use loro::{ExportMode, LoroDoc, VersionVector};
 use n0_future::{FuturesUnorderedBounded, StreamExt};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, error_span, info, Instrument};
+use tracing::{error, error_span, info, Instrument};
 
 #[derive(Debug, Clone)]
 pub struct IrohLoroProtocol {
@@ -71,7 +71,7 @@ impl IrohLoroProtocol {
     pub async fn respond_sync(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
         let conn = conn.await?;
         let peer = get_remote_node_id(&conn)?;
-        info!(peer=%peer.fmt_short(),"incoming sync request");
+        info!(peer=%peer.fmt_short(), "incoming sync request");
         self.initiate_sync(conn, SyncMode::Continuous)
             .instrument(error_span!("accept", peer=%peer.fmt_short()))
             .await
@@ -108,12 +108,15 @@ struct RemoteState {
 
 impl SyncSession {
     async fn run_sync(&self) -> Result<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let _sub = self.doc.subscribe_local_update(Box::new(move |_u| {
-            info!("doc updated locally, queue update message");
-            tx.try_send(()).ok();
-            true
-        }));
+        let local_update = Arc::new(tokio::sync::Notify::new());
+        let _sub = self.doc.subscribe_local_update({
+            let local_update = local_update.clone();
+            Box::new(move |_u| {
+                info!("doc updated locally, queue update message");
+                local_update.notify_waiters();
+                true
+            })
+        });
 
         const TASK_CONCURRENCY: usize = 20;
         let mut pending_recv = FuturesUnorderedBounded::new(TASK_CONCURRENCY);
@@ -165,7 +168,7 @@ impl SyncSession {
                     }
                 },
                 // Responses to local document changes
-                _ = rx.recv(), if has_capacity(&pending_send) && !rx.is_closed() => {
+                _ = local_update.notified(), if has_capacity(&pending_send) => {
                     // capacity checked in precondition above
                     if let Some(message) = self.update_if_needed()? {
                         pending_send.push(self.send(message));
@@ -301,12 +304,13 @@ mod tests {
 
     use iroh::protocol::Router;
     use loro::{EventTriggerKind, LoroDoc};
+    use testresult::TestResult;
     use tracing::{error_span, info, Instrument};
     use tracing_test::traced_test;
 
     use crate::{IrohLoroProtocol, SyncMode};
 
-    async fn setup_node(doc: LoroDoc) -> anyhow::Result<(Router, IrohLoroProtocol)> {
+    async fn setup_node(doc: LoroDoc) -> TestResult<(Router, IrohLoroProtocol)> {
         let proto = IrohLoroProtocol::new(doc);
         let endpoint = iroh::Endpoint::builder().bind().await?;
 
@@ -320,52 +324,47 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn basic() {
+    async fn basic() -> TestResult<()> {
         let doc_a = LoroDoc::new();
         let doc_b = LoroDoc::new();
-        doc_b
-            .get_text("text")
-            .update("hello", Default::default())
-            .unwrap();
+        doc_b.get_text("text").update("hello", Default::default())?;
         assert_eq!(doc_b.get_text("text").to_string().as_str(), "hello");
         assert_eq!(doc_a.get_text("text").to_string().as_str(), "");
 
-        let (router_a, proto_a) = setup_node(doc_a.clone()).await.unwrap();
-        let (router_b, _proto_b) = setup_node(doc_b.clone()).await.unwrap();
+        let (router_a, proto_a) = setup_node(doc_a.clone()).await?;
+        let (router_b, _proto_b) = setup_node(doc_b.clone()).await?;
 
-        let addr_b = router_b.endpoint().node_addr().await.unwrap();
+        let addr_b = router_b.endpoint().node_addr().await?;
 
         let conn_a_to_b = router_a
             .endpoint()
             .connect(addr_b.clone(), IrohLoroProtocol::ALPN)
-            .await
-            .unwrap();
+            .await?;
 
         proto_a
             .initiate_sync(conn_a_to_b, SyncMode::Once)
             .instrument(error_span!("connect", peer = %addr_b.node_id.fmt_short()))
-            .await
-            .unwrap();
+            .await?;
 
         assert_eq!(doc_b.get_text("text").to_string().as_str(), "hello");
         assert_eq!(doc_a.get_text("text").to_string().as_str(), "hello");
+        Ok(())
     }
 
     #[tokio::test]
     #[traced_test]
-    async fn updates() {
+    async fn updates() -> TestResult<()> {
         let doc_a = LoroDoc::new();
         let doc_b = LoroDoc::new();
-        let (router_a, proto_a) = setup_node(doc_a.clone()).await.unwrap();
-        let (router_b, _proto_b) = setup_node(doc_b.clone()).await.unwrap();
+        let (router_a, proto_a) = setup_node(doc_a.clone()).await?;
+        let (router_b, _proto_b) = setup_node(doc_b.clone()).await?;
 
-        let addr_b = router_b.endpoint().node_addr().await.unwrap();
+        let addr_b = router_b.endpoint().node_addr().await?;
 
         let conn_a_to_b = router_a
             .endpoint()
             .connect(addr_b.clone(), IrohLoroProtocol::ALPN)
-            .await
-            .unwrap();
+            .await?;
 
         let _t = tokio::task::spawn(async move {
             proto_a
@@ -390,10 +389,7 @@ mod tests {
         }));
 
         info!("now update text on a");
-        doc_a
-            .get_text("text")
-            .update("a", Default::default())
-            .unwrap();
+        doc_a.get_text("text").update("a", Default::default())?;
         doc_a.commit();
         let _ = tokio::time::timeout(Duration::from_millis(500), update_b_rx.recv())
             .await
@@ -404,10 +400,7 @@ mod tests {
         assert_eq!(doc_b.get_text("text").to_string().as_str(), "a");
 
         info!("now update text on b");
-        doc_b
-            .get_text("text")
-            .update("b", Default::default())
-            .unwrap();
+        doc_b.get_text("text").update("b", Default::default())?;
         doc_b.commit();
 
         let _ = tokio::time::timeout(Duration::from_millis(1000), update_a_rx.recv())
@@ -416,5 +409,6 @@ mod tests {
             .expect("update channel closed before receiving update");
         info!("a received update from b");
         assert_eq!(doc_a.get_text("text").to_string().as_str(), "b");
+        Ok(())
     }
 }

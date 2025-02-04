@@ -24,4 +24,5 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [dev-dependencies]
+testresult = "0.4.1"
 tracing-test = "0.2.5"
