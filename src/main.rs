@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
-use clap::{Parser, command};
-use iroh_loro::IrohLoroProtocol;
+use clap::{command, Parser};
+use iroh_loro::{sync_doc, IrohLoroProtocol};
+use loro::{EventTriggerKind, LoroDoc, UpdateOptions};
 use notify::Watcher;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -22,69 +25,64 @@ enum Cli {
 async fn main() -> Result<()> {
     let opts = Cli::parse();
 
+    let doc = Arc::new(LoroDoc::new());
+
     let mut tasks = JoinSet::new();
 
-    let iroh = match opts {
-        Cli::Serve { file_path } => {
-            // Initialize document with file contents
-            let contents = tokio::fs::read_to_string(&file_path).await?;
+    let iroh = {
+        let secret_key_name = match &opts {
+            Cli::Serve { .. } => Some("key.ed25519"),
+            Cli::Join { .. } => None,
+        };
+        let protocol = IrohLoroProtocol::new(doc.clone());
+        setup_node(protocol, secret_key_name).await?
+    };
 
-            let doc = loro::LoroDoc::new();
+    let (file_path, initiate) = match opts {
+        Cli::Serve { file_path } => {
+            println!("Serving file: {}", file_path);
+
+            let contents = tokio::fs::read_to_string(&file_path).await?;
             doc.get_text("text")
                 .update_by_line(&contents, loro::UpdateOptions::default())?;
             doc.commit();
 
-            println!("Serving file: {}", file_path);
-
-            let protocol = setup_protocol(doc, file_path.clone(), &mut tasks).await?;
-            let iroh = setup_node(protocol.clone(), Some("key.ed25519")).await?;
-
-            tasks.spawn(async move {
-                if let Err(e) = watch_files(file_path, protocol).await {
-                    println!("❌ File watcher task failed: {e}");
-                }
-            });
-
-            iroh
+            (file_path, None)
         }
-
         Cli::Join {
             remote_id,
             file_path,
         } => {
-            let doc = loro::LoroDoc::new();
             if !std::path::Path::new(&file_path).exists() {
                 tokio::fs::write(&file_path, "").await?;
                 println!("Created new file at: {file_path}");
             }
-
-            let protocol = setup_protocol(doc, file_path.clone(), &mut tasks).await?;
-            let iroh = setup_node(protocol.clone(), None).await?;
-
-            tasks.spawn({
-                let protocol = protocol.clone();
-                async move {
-                    if let Err(e) = watch_files(file_path, protocol).await {
-                        println!("❌ File watcher task failed: {e}");
-                    }
-                }
-            });
-
-            // Connect to remote node and sync
-            let conn = iroh
-                .endpoint()
-                .connect(remote_id, IrohLoroProtocol::ALPN)
-                .await?;
-
-            tasks.spawn(async move {
-                if let Err(e) = protocol.initiate_sync(conn).await {
-                    println!("Sync protocol failed: {e}");
-                }
-            });
-
-            iroh
+            (file_path, Some(remote_id))
         }
     };
+
+    // Sync file with doc and vice-versa
+    tasks.spawn(update_file_on_doc_change(doc.clone(), file_path.clone()));
+    tasks.spawn({
+        let doc = doc.clone();
+        async move {
+            if let Err(e) = update_doc_on_file_change(doc, file_path).await {
+                println!("❌ File watcher task failed: {e}");
+            }
+        }
+    });
+
+    if let Some(remote_id) = initiate {
+        let conn = iroh
+            .endpoint()
+            .connect(remote_id, IrohLoroProtocol::ALPN)
+            .await?;
+        tasks.spawn(async move {
+            if let Err(e) = sync_doc(&doc, &conn).await {
+                println!("Sync protocol failed: {e}");
+            }
+        });
+    }
 
     // Wait for Ctrl+C
     signal::ctrl_c().await?;
@@ -106,27 +104,22 @@ async fn main() -> Result<()> {
     .await
 }
 
-// Common protocol setup function for both Serve and Join modes
-async fn setup_protocol(
-    doc: loro::LoroDoc,
-    file_path: String,
-    tasks: &mut JoinSet<()>,
-) -> Result<IrohLoroProtocol> {
-    let (tx, mut rx) = mpsc::channel(100);
-    let protocol = IrohLoroProtocol::new(doc, tx);
-
-    // Spawn file writer task
-    tasks.spawn(async move {
-        while let Some(contents) = rx.recv().await {
-            println!("💾 Writing new contents to file. Length={}", contents.len());
-            match tokio::fs::write(&file_path, contents).await {
-                Ok(_) => println!("✅ Successfully wrote to file"),
-                Err(e) => println!("❌ Failed to write to file: {}", e),
-            }
+async fn update_file_on_doc_change(doc: Arc<LoroDoc>, file_path: String) {
+    let (tx, mut rx) = mpsc::channel(1);
+    let _sub = doc.subscribe_root(Arc::new(move |ev| {
+        if ev.triggered_by != EventTriggerKind::Local {
+            println!("Doc update detected, trigger file write");
+            tx.try_send(()).ok();
         }
-    });
-
-    Ok(protocol)
+    }));
+    while let Some(_) = rx.recv().await {
+        let contents = doc.get_text("text").to_string();
+        println!("💾 Writing new contents to file. Length={}", contents.len());
+        match tokio::fs::write(&file_path, contents).await {
+            Ok(_) => println!("✅ Successfully wrote to file"),
+            Err(e) => println!("❌ Failed to write to file: {}", e),
+        }
+    }
 }
 
 // Common setup function for both Serve and Join modes
@@ -165,7 +158,7 @@ async fn setup_node(
 }
 
 // File watcher for watching given file path that updates the loro doc when it changes
-async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()> {
+async fn update_doc_on_file_change(doc: Arc<LoroDoc>, file_path: String) -> Result<()> {
     println!("👀 Starting file watcher for: {}", file_path);
     let (notify_tx, mut notify_rx) = mpsc::channel(10);
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -186,13 +179,31 @@ async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()
                 println!("📝 File modification detected");
                 let contents = tokio::fs::read_to_string(&file_path).await?;
                 println!("📖 Read file contents (length={})", contents.len());
-                protocol.update_doc(&contents)?;
+                update_doc(&doc, &contents)?;
             }
             _ => {
                 // Ignoring other watcher events
             }
         }
     }
+
+    Ok(())
+}
+
+fn update_doc(doc: &LoroDoc, new_doc: &str) -> anyhow::Result<()> {
+    println!(
+        "📝 Local file changed. Updating doc... (length={})",
+        new_doc.len()
+    );
+    let mut opts = UpdateOptions::default();
+    if new_doc.len() > 50_000 {
+        opts.use_refined_diff = false;
+        doc.get_text("text").update_by_line(new_doc, opts)?;
+    } else {
+        doc.get_text("text").update(new_doc, opts)?;
+    }
+    doc.commit();
+    println!("✅ Local update committed");
 
     Ok(())
 }
