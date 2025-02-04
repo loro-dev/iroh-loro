@@ -106,6 +106,8 @@ struct SyncSession {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteState {
     latest_vv: VersionVector,
+    /// Invariant: `assert_eq!(oldest_vv.partial_cmp(&latest_vv), Some(Ordering::Less))` (unless latest_vv is empty).
+    /// The oldest vv must always be less than the latest vv and must never be diverged from latest vv.
     oldest_vv: VersionVector,
 }
 
@@ -259,6 +261,12 @@ impl SyncSession {
         let close_when_done = self.close_when_done.load(atomic::Ordering::Relaxed);
         let our_state = RemoteState::new(&self.doc);
         let mut remote = self.remote.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
+        let diverged_at = our_state.latest_vv.intersection(&remote.latest_vv);
+        if our_state.oldest_vv.partial_cmp(&diverged_at) != Some(Ordering::Less) {
+            // We can only sync if the point at which we diverged is strictly after our oldest version.
+            self.conn.close(2u32.into(), b"history too outdated");
+            anyhow::bail!("Can't sync: point at which we diverged is beyond our oldest history");
+        }
         Ok(match our_state.latest_vv.partial_cmp(&remote.latest_vv) {
             None => {
                 // We diverged: Send a diff and request to get a diff back, too
