@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, command};
+use clap::{command, Parser};
 use iroh_loro::{IrohLoroProtocol, SyncMode};
 use notify::Watcher;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -22,6 +23,7 @@ enum Cli {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
     let opts = Cli::parse();
 
     let doc = loro::LoroDoc::new();
@@ -36,7 +38,7 @@ async fn main() -> Result<()> {
             doc.get_text("text").insert(0, &contents)?;
             doc.commit();
 
-            println!("Serving file: {}", file_path);
+            info!("Serving file: {}", file_path);
 
             let iroh = setup_node(protocol.clone(), Some("key.ed25519")).await?;
 
@@ -49,7 +51,7 @@ async fn main() -> Result<()> {
         } => {
             if !std::path::Path::new(&file_path).exists() {
                 tokio::fs::write(&file_path, "").await?;
-                println!("Created new file at: {file_path}");
+                info!("Created new file at: {file_path}");
             }
 
             let iroh = setup_node(protocol.clone(), None).await?;
@@ -62,7 +64,7 @@ async fn main() -> Result<()> {
 
             tasks.spawn(async move {
                 if let Err(e) = protocol.initiate_sync(conn, SyncMode::Continuous).await {
-                    println!("Sync protocol failed: {e}");
+                    info!("Sync protocol failed: {e}");
                 }
             });
 
@@ -76,7 +78,7 @@ async fn main() -> Result<()> {
         let file_path = file_path.clone();
         async move {
             if let Err(e) = write_txt_changes_to_file(doc, file_path).await {
-                println!("❌ Loro subscription watcher task failed: {e}");
+                error!("Loro subscription watcher task failed: {e}");
             }
         }
     });
@@ -85,7 +87,7 @@ async fn main() -> Result<()> {
         let doc = doc.clone();
         async move {
             if let Err(e) = watch_file_and_update_txt(file_path, doc).await {
-                println!("❌ File watcher task failed: {e}");
+                error!("File watcher task failed: {e}");
             }
         }
     });
@@ -95,15 +97,15 @@ async fn main() -> Result<()> {
 
     n0_future::future::race(
         async move {
-            println!("Received Ctrl+C, shutting down...");
+            info!("Received Ctrl+C, shutting down...");
             iroh.shutdown().await?;
             tasks.shutdown().await;
-            println!("shut down gracefully");
+            info!("shut down gracefully");
             Ok(())
         },
         async {
             signal::ctrl_c().await?;
-            println!("Another Ctrl+C detected, forcefully shutting down...");
+            info!("Another Ctrl+C detected, forcefully shutting down...");
             std::process::exit(1);
         },
     )
@@ -140,7 +142,7 @@ async fn setup_node(
         .await?;
 
     let addr = iroh.endpoint().node_addr().await?;
-    println!("Running\nNode Id: {}", addr.node_id);
+    info!("Running - Node Id: {}", addr.node_id);
 
     Ok(iroh)
 }
@@ -159,10 +161,10 @@ async fn write_txt_changes_to_file(doc: loro::LoroDoc, file_path: String) -> Res
     let _sub = doc.subscribe(&txt.id(), callback);
 
     while let Some(contents) = rx.recv().await {
-        println!("💾 Writing new contents to file. Length={}", contents.len());
+        info!("💾 Writing new contents to file. Length={}", contents.len());
         match tokio::fs::write(&file_path, contents).await {
-            Ok(_) => println!("✅ Successfully wrote to file"),
-            Err(e) => println!("❌ Failed to write to file: {}", e),
+            Ok(_) => info!("✅ Successfully wrote to file"),
+            Err(e) => error!("Failed to write to file: {}", e),
         }
     }
 
@@ -171,7 +173,7 @@ async fn write_txt_changes_to_file(doc: loro::LoroDoc, file_path: String) -> Res
 
 // File watcher for watching given file path that updates the loro doc when it changes
 async fn watch_file_and_update_txt(file_path: String, doc: loro::LoroDoc) -> Result<()> {
-    println!("👀 Starting file watcher for: {file_path}");
+    info!("👀 Starting file watcher for: {file_path}");
     let (notify_tx, mut notify_rx) = mpsc::channel(100);
     let mut watcher = notify::recommended_watcher(move |res| {
         let _ = notify_tx.try_send(res); // ignore when the rx is dropped
@@ -188,9 +190,9 @@ async fn watch_file_and_update_txt(file_path: String, doc: loro::LoroDoc) -> Res
                 kind: notify::EventKind::Modify(_),
                 ..
             } => {
-                println!("📝 File modification detected");
+                info!("📝 File modification detected");
                 let contents = tokio::fs::read_to_string(&file_path).await?;
-                println!("📖 Read file contents (length={})", contents.len());
+                info!("📖 Read file contents (length={})", contents.len());
                 let mut opts = loro::UpdateOptions::default();
                 if contents.len() > 50_000 {
                     opts.use_refined_diff = false;
@@ -199,7 +201,7 @@ async fn watch_file_and_update_txt(file_path: String, doc: loro::LoroDoc) -> Res
                     doc.get_text("text").update(&contents, opts)?;
                 }
                 doc.commit();
-                println!("✅ Local update committed");
+                info!("✅ Local update committed");
             }
             _ => {
                 // Ignoring other watcher events

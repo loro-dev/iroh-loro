@@ -4,16 +4,20 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Mutex,
         atomic::{self, AtomicBool},
+        Arc, Mutex,
     },
 };
 
 use anyhow::Result;
-use iroh::{endpoint::RecvStream, protocol::ProtocolHandler};
+use iroh::{
+    endpoint::{get_remote_node_id, ConnectionError, RecvStream},
+    protocol::ProtocolHandler,
+};
 use loro::{ExportMode, LoroDoc, VersionVector};
 use n0_future::{FuturesUnorderedBounded, StreamExt};
 use serde::{Deserialize, Serialize};
+use tracing::{error, error_span, info, Instrument};
 
 #[derive(Debug, Clone)]
 pub struct IrohLoroProtocol {
@@ -66,7 +70,11 @@ impl IrohLoroProtocol {
 
     pub async fn respond_sync(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
         let conn = conn.await?;
-        self.initiate_sync(conn, SyncMode::Continuous).await
+        let peer = get_remote_node_id(&conn)?;
+        info!(peer=%peer.fmt_short(), "incoming sync request");
+        self.initiate_sync(conn, SyncMode::Continuous)
+            .instrument(error_span!("accept", peer=%peer.fmt_short()))
+            .await
     }
 }
 
@@ -77,10 +85,9 @@ impl ProtocolHandler for IrohLoroProtocol {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
         let this = self.clone();
         Box::pin(async move {
-            println!("🔌 Peer connected");
             let result = this.respond_sync(conn).await;
             if let Err(e) = result {
-                println!("❌ Error: {e}");
+                error!("incoming sync request failed: {e}");
                 return Err(e);
             }
             Ok(())
@@ -101,11 +108,15 @@ struct RemoteState {
 
 impl SyncSession {
     async fn run_sync(&self) -> Result<()> {
-        let (tx, rx) = async_channel::bounded(128);
-        let _sub = self.doc.subscribe_local_update(Box::new(move |u| {
-            tx.send_blocking(u.clone()).unwrap();
-            true
-        }));
+        let local_update = Arc::new(tokio::sync::Notify::new());
+        let _sub = self.doc.subscribe_local_update({
+            let local_update = local_update.clone();
+            Box::new(move |_u| {
+                info!("doc updated locally, queue update message");
+                local_update.notify_waiters();
+                true
+            })
+        });
 
         const TASK_CONCURRENCY: usize = 20;
         let mut pending_recv = FuturesUnorderedBounded::new(TASK_CONCURRENCY);
@@ -115,13 +126,27 @@ impl SyncSession {
         loop {
             tokio::select! {
                 close = self.conn.closed() => {
-                    println!("🔌 Peer disconnected: {close:?}");
-                    return Ok(());
+                    info!("🔌 Peer disconnected: {close:?}");
+                    break;
                 },
                 // Accept incoming messages via uni-direction streams, if we have capacities to handle them
                 stream = self.conn.accept_uni(), if has_capacity(&pending_recv) && has_capacity(&pending_send) => {
                     // capacity checked in precondition above
-                    pending_recv.push(self.recv(stream?));
+                    match stream {
+                        Err(ConnectionError::ApplicationClosed(close)) => {
+                            info!("🔌 Peer disconnected: connection closed by peer {close:?}");
+                            break;
+                        },
+                        Err(ConnectionError::LocallyClosed) => {
+                            info!("🔌 Peer disconnected: connection closed by us");
+                            break;
+                        },
+                        Err(err) => {
+                            error!("🔌 Peer disconnected with error: {err:?}");
+                            return Err(err.into());
+                        }
+                        Ok(stream) => pending_recv.push(self.recv(stream)),
+                    }
                 },
                 // Work on receiving messages
                 Some(result) = pending_recv.next(), if has_capacity(&pending_send) => {
@@ -132,35 +157,36 @@ impl SyncSession {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Receiving message failed: {e}");
+                            error!("Receiving message failed: {e}");
                         }
                     }
                 },
                 // Work on sending diffs
                 Some(result) = pending_send.next() => {
                     if let Err(e) = result {
-                        eprintln!("Sending message failed: {e}");
+                        error!("Sending message failed: {e}");
                     }
                 },
                 // Responses to local document changes
-                msg = rx.recv(), if has_capacity(&pending_send) => {
+                _ = local_update.notified(), if has_capacity(&pending_send) => {
                     // capacity checked in precondition above
-                    pending_send.push(self.send(Message {
-                        diff: Some(Diff { bytes: msg?.into() }),
-                        ..Message::default()
-                    }));
+                    if let Some(message) = self.update_if_needed()? {
+                        pending_send.push(self.send(message));
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     async fn recv(&self, mut stream: RecvStream) -> Result<()> {
         let msg = stream.read_to_end(10_000_000).await?; // 10 MB limit for now
         let message: Message<'_> = postcard::from_bytes(&msg)?;
-        println!(
-            "📥 Received sync msg from peer (size={} has_diff={})",
-            msg.len(),
-            message.diff.is_some()
+        info!(
+            size = msg.len(),
+            has_diff = message.diff.is_some(),
+            has_vv = message.version_vector.is_some(),
+            "Received sync msg from peer",
         );
 
         if let Some(vv) = &message.version_vector {
@@ -170,7 +196,7 @@ impl SyncSession {
 
         if let Some(diff) = message.diff {
             let status = self.doc.import(diff.as_ref())?;
-            println!(
+            info!(
                 "📥 Imported diff (pending={} any_successes={})",
                 status.pending.is_some(),
                 status.success.is_empty()
@@ -185,10 +211,11 @@ impl SyncSession {
 
     async fn send(&self, message: Message<'_>) -> Result<()> {
         let msg = postcard::to_allocvec(&message)?;
-        println!(
-            "📤 Sending sync msg to peer (size={} has_diff={})",
-            msg.len(),
-            message.diff.is_some()
+        info!(
+            size = msg.len(),
+            has_diff = message.diff.is_some(),
+            has_vv = message.version_vector.is_some(),
+            "Sending sync msg to peer",
         );
         let mut stream = self.conn.open_uni().await?;
         stream.write_all(&msg).await?;
@@ -203,7 +230,7 @@ impl SyncSession {
         Ok(match our_vv.partial_cmp(&remote.vv) {
             None => {
                 // We diverged: Send a diff and request to get a diff back, too
-                println!("⛓️‍💥 We are diverged");
+                info!("⛓️‍💥 We are diverged");
                 let diff = self.doc.export(ExportMode::updates(&remote.vv))?;
                 // We assume that the remote will eventually receive our message and be on our state
                 remote.vv.extend_to_include_vv(our_vv.iter());
@@ -215,11 +242,11 @@ impl SyncSession {
             }
             Some(Ordering::Greater) => {
                 // We're ahead: Send a diff, but no need to tell the other side to update us
-                println!("📈 We are ahead");
+                info!("📈 We are ahead");
                 let diff = self.doc.export(ExportMode::updates(&remote.vv))?;
                 // We assume that the remote will eventually receive our message and be on our state
                 remote.vv.extend_to_include_vv(our_vv.iter());
-                println!("🤝 Assuming to be in sync once peer receives this");
+                info!("🤝 Assuming to be in sync once peer receives this");
                 Some(Message {
                     version_vector: None,
                     close_when_done,
@@ -228,7 +255,7 @@ impl SyncSession {
             }
             Some(Ordering::Less) => {
                 // We are behind: we inform the other side about what we're missing, apparently we didn't get it
-                println!("📉 We are behind");
+                info!("📉 We are behind");
                 Some(Message {
                     version_vector: Some(our_vv),
                     close_when_done,
@@ -236,7 +263,7 @@ impl SyncSession {
                 })
             }
             Some(Ordering::Equal) => {
-                println!("🤝 In sync with peer");
+                info!("🤝 In sync with peer");
                 if close_when_done {
                     self.conn.close(0u32.into(), b"in sync, thank you");
                 }
@@ -267,5 +294,121 @@ struct Diff<'a> {
 impl<'a> AsRef<[u8]> for Diff<'a> {
     fn as_ref(&self) -> &[u8] {
         self.bytes.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use std::{sync::Arc, time::Duration};
+
+    use iroh::protocol::Router;
+    use loro::{EventTriggerKind, LoroDoc};
+    use testresult::TestResult;
+    use tracing::{error_span, info, Instrument};
+    use tracing_test::traced_test;
+
+    use crate::{IrohLoroProtocol, SyncMode};
+
+    async fn setup_node(doc: LoroDoc) -> TestResult<(Router, IrohLoroProtocol)> {
+        let proto = IrohLoroProtocol::new(doc);
+        let endpoint = iroh::Endpoint::builder().bind().await?;
+
+        // Create and configure iroh node
+        let router = iroh::protocol::Router::builder(endpoint)
+            .accept(IrohLoroProtocol::ALPN, proto.clone())
+            .spawn()
+            .await?;
+        Ok((router, proto))
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn basic() -> TestResult<()> {
+        let doc_a = LoroDoc::new();
+        let doc_b = LoroDoc::new();
+        doc_b.get_text("text").update("hello", Default::default())?;
+        assert_eq!(doc_b.get_text("text").to_string().as_str(), "hello");
+        assert_eq!(doc_a.get_text("text").to_string().as_str(), "");
+
+        let (router_a, proto_a) = setup_node(doc_a.clone()).await?;
+        let (router_b, _proto_b) = setup_node(doc_b.clone()).await?;
+
+        let addr_b = router_b.endpoint().node_addr().await?;
+
+        let conn_a_to_b = router_a
+            .endpoint()
+            .connect(addr_b.clone(), IrohLoroProtocol::ALPN)
+            .await?;
+
+        proto_a
+            .initiate_sync(conn_a_to_b, SyncMode::Once)
+            .instrument(error_span!("connect", peer = %addr_b.node_id.fmt_short()))
+            .await?;
+
+        assert_eq!(doc_b.get_text("text").to_string().as_str(), "hello");
+        assert_eq!(doc_a.get_text("text").to_string().as_str(), "hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn updates() -> TestResult<()> {
+        let doc_a = LoroDoc::new();
+        let doc_b = LoroDoc::new();
+        let (router_a, proto_a) = setup_node(doc_a.clone()).await?;
+        let (router_b, _proto_b) = setup_node(doc_b.clone()).await?;
+
+        let addr_b = router_b.endpoint().node_addr().await?;
+
+        let conn_a_to_b = router_a
+            .endpoint()
+            .connect(addr_b.clone(), IrohLoroProtocol::ALPN)
+            .await?;
+
+        let _t = tokio::task::spawn(async move {
+            proto_a
+                .initiate_sync(conn_a_to_b, SyncMode::Continuous)
+                .instrument(error_span!("connect", peer = %addr_b.node_id.fmt_short()))
+                .await
+                .unwrap();
+        });
+
+        // setup update listener channels
+        let (update_a_tx, mut update_a_rx) = tokio::sync::mpsc::channel(1);
+        let _sub = doc_a.subscribe_root(Arc::new(move |update| {
+            if update.triggered_by == EventTriggerKind::Import {
+                update_a_tx.try_send(()).ok();
+            }
+        }));
+        let (update_b_tx, mut update_b_rx) = tokio::sync::mpsc::channel(1);
+        let _sub = doc_b.subscribe_root(Arc::new(move |update| {
+            if update.triggered_by == EventTriggerKind::Import {
+                update_b_tx.try_send(()).ok();
+            }
+        }));
+
+        info!("now update text on a");
+        doc_a.get_text("text").update("a", Default::default())?;
+        doc_a.commit();
+        let _ = tokio::time::timeout(Duration::from_millis(500), update_b_rx.recv())
+            .await
+            .expect("did not receive update within timeout")
+            .expect("update channel closed before receiving update");
+
+        info!("b received update from a");
+        assert_eq!(doc_b.get_text("text").to_string().as_str(), "a");
+
+        info!("now update text on b");
+        doc_b.get_text("text").update("b", Default::default())?;
+        doc_b.commit();
+
+        let _ = tokio::time::timeout(Duration::from_millis(1000), update_a_rx.recv())
+            .await
+            .expect("did not receive update within timeout")
+            .expect("update channel closed before receiving update");
+        info!("a received update from b");
+        assert_eq!(doc_a.get_text("text").to_string().as_str(), "b");
+        Ok(())
     }
 }
