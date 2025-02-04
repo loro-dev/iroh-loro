@@ -46,8 +46,11 @@ impl IrohLoroProtocol {
         conn: iroh::endpoint::Connection,
         mode: SyncMode,
     ) -> Result<()> {
-        let vv_msg = Message {
-            version_vector: Some(self.doc.oplog_vv()),
+        let state_msg = Message {
+            state: Some(RemoteState::new(&self.doc)),
+            diff: Some(Diff {
+                bytes: self.doc.export(ExportMode::state_only(None))?.into(),
+            }),
             ..Message::default()
         };
         let session = SyncSession {
@@ -57,14 +60,12 @@ impl IrohLoroProtocol {
                 SyncMode::Continuous => false.into(),
                 SyncMode::Once => true.into(),
             },
-            remote: Mutex::new(RemoteState {
-                vv: VersionVector::new(),
-            }),
+            remote: Mutex::new(RemoteState::empty()),
         };
         // Do two things simultaneously:
-        // 1. send our version vector
+        // 1. send information about our state (latest vv, oldest vv) and a latest state snapshot
         // 2. run a loop that accepts messages from the remote and sends updates
-        n0_future::future::try_zip(session.send(vv_msg), session.run_sync()).await?;
+        n0_future::future::try_zip(session.send(state_msg), session.run_sync()).await?;
         Ok(())
     }
 
@@ -102,8 +103,26 @@ struct SyncSession {
     remote: Mutex<RemoteState>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteState {
-    vv: VersionVector,
+    latest_vv: VersionVector,
+    oldest_vv: VersionVector,
+}
+
+impl RemoteState {
+    pub fn new(doc: &LoroDoc) -> Self {
+        Self {
+            latest_vv: doc.oplog_vv(),
+            oldest_vv: doc.shallow_since_vv().to_vv(),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            latest_vv: VersionVector::new(),
+            oldest_vv: VersionVector::new(),
+        }
+    }
 }
 
 impl SyncSession {
@@ -126,7 +145,11 @@ impl SyncSession {
         loop {
             tokio::select! {
                 close = self.conn.closed() => {
-                    info!("🔌 Peer disconnected: {close:?}");
+                    if close == ConnectionError::LocallyClosed {
+                        info!("🔌 Disconnecting.");
+                    } else {
+                        info!("🔌 Peer disconnected: {close:?}");
+                    }
                     break;
                 },
                 // Accept incoming messages via uni-direction streams, if we have capacities to handle them
@@ -185,21 +208,30 @@ impl SyncSession {
         info!(
             size = msg.len(),
             has_diff = message.diff.is_some(),
-            has_vv = message.version_vector.is_some(),
+            has_state = message.state.is_some(),
             "Received sync msg from peer",
         );
 
-        if let Some(vv) = &message.version_vector {
+        if let Some(state) = &message.state {
             let mut remote = self.remote.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
-            remote.vv.extend_to_include_vv(vv.iter());
+            remote
+                .latest_vv
+                .extend_to_include_vv(state.latest_vv.iter());
+            remote
+                .oldest_vv
+                .extend_to_include_vv(state.oldest_vv.iter());
         }
 
         if let Some(diff) = message.diff {
             let status = self.doc.import(diff.as_ref())?;
+            let version = self.doc.oplog_frontiers();
+            let shallow_since = self.doc.shallow_since_frontiers();
             info!(
-                "📥 Imported diff (pending={} any_successes={})",
-                status.pending.is_some(),
-                status.success.is_empty()
+                pending = status.pending.is_some(),
+                any_successes = !status.success.is_empty(),
+                ?version,
+                ?shallow_since,
+                "📥 Imported diff",
             );
         }
 
@@ -214,7 +246,7 @@ impl SyncSession {
         info!(
             size = msg.len(),
             has_diff = message.diff.is_some(),
-            has_vv = message.version_vector.is_some(),
+            has_state = message.state.is_some(),
             "Sending sync msg to peer",
         );
         let mut stream = self.conn.open_uni().await?;
@@ -225,17 +257,19 @@ impl SyncSession {
 
     fn update_if_needed(&self) -> Result<Option<Message<'static>>> {
         let close_when_done = self.close_when_done.load(atomic::Ordering::Relaxed);
-        let our_vv = self.doc.oplog_vv();
+        let our_state = RemoteState::new(&self.doc);
         let mut remote = self.remote.lock().unwrap_or_else(|p| p.into_inner()); // Ignore lock poisons.
-        Ok(match our_vv.partial_cmp(&remote.vv) {
+        Ok(match our_state.latest_vv.partial_cmp(&remote.latest_vv) {
             None => {
                 // We diverged: Send a diff and request to get a diff back, too
                 info!("⛓️‍💥 We are diverged");
-                let diff = self.doc.export(ExportMode::updates(&remote.vv))?;
+                let diff = self.doc.export(ExportMode::updates(&remote.latest_vv))?;
                 // We assume that the remote will eventually receive our message and be on our state
-                remote.vv.extend_to_include_vv(our_vv.iter());
+                remote
+                    .latest_vv
+                    .extend_to_include_vv(our_state.latest_vv.iter());
                 Some(Message {
-                    version_vector: Some(our_vv),
+                    state: Some(our_state),
                     close_when_done,
                     diff: Some(Diff { bytes: diff.into() }),
                 })
@@ -243,12 +277,16 @@ impl SyncSession {
             Some(Ordering::Greater) => {
                 // We're ahead: Send a diff, but no need to tell the other side to update us
                 info!("📈 We are ahead");
-                let diff = self.doc.export(ExportMode::updates(&remote.vv))?;
+                let diff = self.doc.export(ExportMode::updates(&remote.latest_vv))?;
                 // We assume that the remote will eventually receive our message and be on our state
-                remote.vv.extend_to_include_vv(our_vv.iter());
+                remote
+                    .latest_vv
+                    .extend_to_include_vv(our_state.latest_vv.iter());
                 info!("🤝 Assuming to be in sync once peer receives this");
                 Some(Message {
-                    version_vector: None,
+                    // We omit the state in this case, since the peer isn't expected to "have to create" a response update
+                    // Which is what the peer would use the state as information for.
+                    state: None,
                     close_when_done,
                     diff: Some(Diff { bytes: diff.into() }),
                 })
@@ -257,7 +295,7 @@ impl SyncSession {
                 // We are behind: we inform the other side about what we're missing, apparently we didn't get it
                 info!("📉 We are behind");
                 Some(Message {
-                    version_vector: Some(our_vv),
+                    state: Some(our_state),
                     close_when_done,
                     diff: None,
                 })
@@ -279,7 +317,7 @@ fn has_capacity<F>(tasks: &FuturesUnorderedBounded<F>) -> bool {
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct Message<'a> {
-    version_vector: Option<VersionVector>,
+    state: Option<RemoteState>,
     close_when_done: bool,
     #[serde(borrow)]
     diff: Option<Diff<'a>>,
