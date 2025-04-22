@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, command};
 use iroh::protocol::ProtocolHandler;
-use iroh_loro::IrohLoroProtocol;
+use iroh_loro::{IrohLoroProtocol, IrohLoroProtocolInner};
 use notify::Watcher;
 use std::sync::Arc;
 use tokio::signal;
@@ -29,12 +29,12 @@ async fn main() -> anyhow::Result<()> {
         file_path: String,
         key_path: Option<&str>,
     ) -> anyhow::Result<(
-        Arc<IrohLoroProtocol>,
+        Arc<IrohLoroProtocolInner>,
         iroh::protocol::Router,
         tokio::task::JoinHandle<()>,
     )> {
         let secret_key = if let Some(key_path) = key_path {
-            iroh_node_util::load_secret_key(
+            iroh_node_util::fs::load_secret_key(
                 dirs_next::cache_dir()
                     .context("no dir for secret key")?
                     .join("iroh-loro")
@@ -42,11 +42,12 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         } else {
-            iroh::key::SecretKey::generate()
+            let mut rng = rand::rngs::OsRng;
+            iroh::SecretKey::generate(&mut rng)
         };
 
         let (tx, mut rx) = mpsc::channel(100);
-        let p = IrohLoroProtocol::new(doc, tx);
+        let p = IrohLoroProtocolInner::new(doc, tx);
 
         // Spawn file writer task
         let writer_handle = tokio::spawn(async move {
@@ -62,20 +63,24 @@ async fn main() -> anyhow::Result<()> {
         let endpoint = iroh::Endpoint::builder()
             .discovery_n0()
             .secret_key(secret_key)
+            .alpns(vec![IrohLoroProtocolInner::ALPN.to_vec()])
             .bind()
             .await?;
 
         // Create and configure iroh node
         let iroh = iroh::protocol::Router::builder(endpoint)
             .accept(
-                IrohLoroProtocol::ALPN,
-                Arc::clone(&p) as Arc<dyn ProtocolHandler>,
+                IrohLoroProtocolInner::ALPN,
+                IrohLoroProtocol {
+                    inner: Arc::clone(&p),
+                },
             )
             .spawn()
             .await?;
 
         let addr = iroh.endpoint().node_addr().await?;
         println!("Running\nNode Id: {}", addr.node_id);
+        println!("{}", iroh.endpoint().node_id());
 
         Ok((p, iroh, writer_handle))
     }
@@ -83,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     // Modified file watcher setup to return the JoinHandle
     fn spawn_file_watcher(
         file_path: String,
-        p: Arc<IrohLoroProtocol>,
+        p: Arc<IrohLoroProtocolInner>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             println!("👀 Starting file watcher for: {}", file_path);
@@ -156,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
             let node_addr = iroh::NodeAddr::new(remote_id);
             let conn = iroh
                 .endpoint()
-                .connect(node_addr, IrohLoroProtocol::ALPN)
+                .connect(node_addr, IrohLoroProtocolInner::ALPN)
                 .await?;
 
             p.initiate_sync(conn).await?;

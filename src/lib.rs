@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::Result;
-use iroh::protocol::ProtocolHandler;
+use iroh::{endpoint::Connection, protocol::ProtocolHandler};
 use loro::{ExportMode, LoroDoc};
 use tokio::{
     select,
@@ -9,12 +9,17 @@ use tokio::{
 };
 
 #[derive(Debug)]
-pub struct IrohLoroProtocol {
+pub struct IrohLoroProtocolInner {
     inner: Mutex<LoroDoc>,
     sender: mpsc::Sender<String>,
 }
 
-impl IrohLoroProtocol {
+#[derive(Debug)]
+pub struct IrohLoroProtocol {
+    pub inner: Arc<IrohLoroProtocolInner>,
+}
+
+impl IrohLoroProtocolInner {
     pub const ALPN: &'static [u8] = b"iroh/loro/1";
 
     pub fn new(inner: LoroDoc, sender: mpsc::Sender<String>) -> Arc<Self> {
@@ -37,7 +42,7 @@ impl IrohLoroProtocol {
         println!("✅ Local update committed");
     }
 
-    pub async fn initiate_sync(self: Arc<Self>, conn: iroh::endpoint::Connection) -> Result<()> {
+    pub async fn initiate_sync(self: Arc<Self>, conn: Connection) -> Result<()> {
         let (tx, rx) = async_channel::bounded(128);
         let _sub = self
             .inner
@@ -106,12 +111,13 @@ impl IrohLoroProtocol {
 
 impl ProtocolHandler for IrohLoroProtocol {
     fn accept(
-        self: Arc<Self>,
-        conn: iroh::endpoint::Connecting,
+        &self,
+        conn: Connection,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
+        let inner = self.inner.clone();
         Box::pin(async move {
             println!("🔌 Peer connected");
-            let result = Arc::clone(&self).respond_sync(conn).await;
+            let result = inner.initiate_sync(conn).await;
             println!("🔌 Peer disconnected");
             if let Err(e) = result {
                 println!("❌ Error: {}", e);
