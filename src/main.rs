@@ -148,6 +148,7 @@ async fn setup_node(
 
     let endpoint = iroh::Endpoint::builder()
         .discovery_n0()
+        .discovery_local_network()
         .secret_key(secret_key)
         .bind()
         .await?;
@@ -155,8 +156,7 @@ async fn setup_node(
     // Create and configure iroh node
     let iroh = iroh::protocol::Router::builder(endpoint)
         .accept(IrohLoroProtocol::ALPN, protocol)
-        .spawn()
-        .await?;
+        .spawn();
 
     let addr = iroh.endpoint().node_addr().await?;
     println!("Running\nNode Id: {}", addr.node_id);

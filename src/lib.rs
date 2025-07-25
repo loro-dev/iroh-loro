@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::{endpoint::RecvStream, protocol::ProtocolHandler};
@@ -105,22 +105,14 @@ impl IrohLoroProtocol {
 
         Ok(())
     }
-
-    pub async fn respond_sync(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
-        let conn = conn.await?;
-        self.initiate_sync(conn).await
-    }
 }
 
 impl ProtocolHandler for IrohLoroProtocol {
-    fn accept(
-        &self,
-        conn: iroh::endpoint::Connecting,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
+    fn accept(&self, conn: iroh::endpoint::Connection) -> n0_future::boxed::BoxFuture<Result<()>> {
         let this = self.clone();
         Box::pin(async move {
             println!("🔌 Peer connected");
-            let result = this.respond_sync(conn).await;
+            let result = this.initiate_sync(conn).await;
             println!("🔌 Peer disconnected");
             if let Err(e) = result {
                 println!("❌ Error: {}", e);
