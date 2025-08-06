@@ -1,64 +1,61 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::{endpoint::Connection, protocol::ProtocolHandler};
-use loro::{ExportMode, LoroDoc};
-use tokio::{
-    select,
-    sync::{Mutex, mpsc},
-};
+use iroh::{endpoint::RecvStream, protocol::ProtocolHandler};
+use loro::{ExportMode, LoroDoc, UpdateOptions};
+use n0_future::{FuturesUnorderedBounded, StreamExt};
+use tokio::{select, sync::mpsc};
 
-#[derive(Debug)]
-pub struct IrohLoroProtocolInner {
-    inner: Mutex<LoroDoc>,
+#[derive(Debug, Clone)]
+pub struct IrohLoroProtocol {
+    doc: Arc<LoroDoc>,
     sender: mpsc::Sender<String>,
 }
 
-#[derive(Debug)]
-pub struct IrohLoroProtocol {
-    pub inner: Arc<IrohLoroProtocolInner>,
-}
-
-impl IrohLoroProtocolInner {
+impl IrohLoroProtocol {
     pub const ALPN: &'static [u8] = b"iroh/loro/1";
 
-    pub fn new(inner: LoroDoc, sender: mpsc::Sender<String>) -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(inner),
+    pub fn new(doc: LoroDoc, sender: mpsc::Sender<String>) -> Self {
+        Self {
+            doc: Arc::new(doc),
             sender,
-        })
+        }
     }
 
-    pub async fn update_doc(&self, new_doc: &str) {
+    pub fn update_doc(&self, new_doc: &str) -> Result<()> {
         println!(
             "📝 Local file changed. Updating doc... (length={})",
             new_doc.len()
         );
-        let doc = self.inner.lock().await;
-        doc.get_text("text")
-            .update(new_doc, loro::UpdateOptions::default())
-            .unwrap();
-        doc.commit();
+        let mut opts = UpdateOptions::default();
+        if new_doc.len() > 50_000 {
+            opts.use_refined_diff = false;
+            self.doc.get_text("text").update_by_line(new_doc, opts)?;
+        } else {
+            self.doc.get_text("text").update(new_doc, opts)?;
+        }
+        self.doc.commit();
         println!("✅ Local update committed");
+
+        Ok(())
     }
 
-    pub async fn initiate_sync(self: Arc<Self>, conn: Connection) -> Result<()> {
+    pub async fn initiate_sync(&self, conn: iroh::endpoint::Connection) -> Result<()> {
         let (tx, rx) = async_channel::bounded(128);
-        let _sub = self
-            .inner
-            .lock()
-            .await
-            .subscribe_local_update(Box::new(move |u| {
-                tx.send_blocking(u.clone()).unwrap();
-                true
-            }));
+        let _sub = self.doc.subscribe_local_update(Box::new(move |u| {
+            tx.send_blocking(u.clone()).unwrap();
+            true
+        }));
 
-        let sync = self.inner.lock().await.export(ExportMode::all_updates())?;
+        let sync = self.doc.export(ExportMode::all_updates())?;
 
         // Initial sync
         let mut stream = conn.open_uni().await?;
         stream.write_all(&sync).await?;
         stream.finish()?;
+
+        const MAX_CONCURRENT_SYNCS: usize = 20;
+        let mut running_syncs = FuturesUnorderedBounded::new(MAX_CONCURRENT_SYNCS);
 
         // Wait for changes & sync
         loop {
@@ -67,29 +64,17 @@ impl IrohLoroProtocolInner {
                     println!("🔌 Peer disconnected: {close:?}");
                     return Ok(());
                 },
-                // Incoming sync messages
-                stream = conn.accept_uni() => {
-                    let mut stream = stream?;
-                    tokio::spawn({
-                        let this = self.clone();
-                        async move {
-                            let msg = stream.read_to_end(10_000).await?; // 10 KB limit for now
-                            println!("📥 Received sync message from peer (size={})", msg.len());
-                            if let Err(e) = this.inner.lock().await.import(&msg) {
-                                println!("❌ Failed to import sync message: {}", e);
-                            };
-                            println!("✅ Successfully imported sync message");
-
-                            this.sender
-                                .send(this.inner.lock().await.get_text("text").to_string())
-                                .await?;
-
-                            println!("✅ Successfully sent update to local");
-
-                            anyhow::Ok(())
-                        }
-                    });
+                // Accept incoming messages via uni-direction streams, if we have capacities to handle them
+                stream = conn.accept_uni(), if running_syncs.len() < running_syncs.capacity() => {
+                    // capacity checked in precondition above
+                    running_syncs.push(self.handle_sync_message(stream?));
                 },
+                // Work on current syncs
+                Some(result) = running_syncs.next() => {
+                    if let Err(e) = result {
+                        eprintln!("Sync failed: {e}");
+                    }
+                }
                 // Responses to local document changes
                 msg = rx.recv() => {
                     let msg = msg?;
@@ -103,21 +88,31 @@ impl IrohLoroProtocolInner {
         }
     }
 
-    pub async fn respond_sync(self: Arc<Self>, conn: iroh::endpoint::Connecting) -> Result<()> {
-        let conn = conn.await?;
-        self.initiate_sync(conn).await
+    async fn handle_sync_message(&self, mut stream: RecvStream) -> Result<()> {
+        let msg = stream.read_to_end(10_000_000).await?; // 10 MB limit for now
+
+        println!("📥 Received sync message from peer (size={})", msg.len());
+        if let Err(e) = self.doc.import(&msg) {
+            println!("❌ Failed to import sync message: {}", e);
+        };
+        println!("✅ Successfully imported sync message");
+
+        self.sender
+            .send(self.doc.get_text("text").to_string())
+            .await?;
+
+        println!("✅ Successfully sent update to local");
+
+        Ok(())
     }
 }
 
 impl ProtocolHandler for IrohLoroProtocol {
-    fn accept(
-        &self,
-        conn: Connection,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
-        let inner = self.inner.clone();
+    fn accept(&self, conn: iroh::endpoint::Connection) -> n0_future::boxed::BoxFuture<Result<()>> {
+        let this = self.clone();
         Box::pin(async move {
             println!("🔌 Peer connected");
-            let result = inner.initiate_sync(conn).await;
+            let result = this.initiate_sync(conn).await;
             println!("🔌 Peer disconnected");
             if let Err(e) = result {
                 println!("❌ Error: {}", e);
