@@ -1,3 +1,0 @@
-This is test content that will be cleared to test synchronization.
-Line 2 of test content.
-Line 3 of test content.

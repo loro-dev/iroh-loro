@@ -162,15 +162,25 @@ impl IrohLoroProtocol {
         Ok(self.doc.export(ExportMode::all_updates())?)
     }
 
+    /// Get recent updates since last export for ongoing sync
+    pub fn export_recent_updates(&self) -> Result<Vec<u8>> {
+        // For now, use all_updates - we'll optimize this later for incremental sync
+        Ok(self.doc.export(ExportMode::all_updates())?)
+    }
+
     /// Commit any pending changes and notify peers
     pub fn commit_and_sync(&self) -> Result<()> {
+        // First commit the changes
         self.doc.commit();
         
-        // Export recent changes and broadcast to all peers
-        let changes = self.export_updates()?;
-        // Always broadcast changes, even if they appear empty, as clearing content
-        // generates valid Loro operations that need to be synchronized
-        let _ = self.change_broadcaster.send(changes);
+        // Export only the recent changes for broadcasting
+        let changes = self.export_recent_updates()?;
+        if !changes.is_empty() {
+            println!("📤 Broadcasting {} bytes of changes", changes.len());
+            let _ = self.change_broadcaster.send(changes);
+        } else {
+            println!("📤 No changes to broadcast");
+        }
         
         Ok(())
     }

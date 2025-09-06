@@ -229,8 +229,22 @@ async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()
     println!("👀 Watching file: {}", file_path);
     
     while rx.recv().await.is_some() {
-        // Small delay to avoid rapid fire events
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Small delay to handle rapid file system events, but fast enough for manual saves
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        
+        // Collect any additional events that arrive quickly (debouncing)
+        let mut additional_events = 0;
+        while rx.try_recv().is_ok() {
+            additional_events += 1;
+            if additional_events > 5 {
+                break; // Prevent infinite loop on rapid events
+            }
+        }
+        
+        // If we collected events, add a small delay to let file system settle
+        if additional_events > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
         
         match tokio::fs::read_to_string(&file_path).await {
             Ok(new_content) => {
@@ -240,26 +254,22 @@ async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()
                 let current_content = text.to_string();
                 
                 if current_content != new_content {
-                    // Clear and insert new content
-                    let current_len = text.len_utf16();
-                    if current_len > 0 {
-                        if let Err(e) = text.delete(0, current_len) {
-                            println!("❌ Failed to delete text: {e}");
-                            continue;
-                        }
-                    }
-                    if !new_content.is_empty() {
-                        if let Err(e) = text.insert(0, &new_content) {
-                            println!("❌ Failed to insert text: {e}");
-                            continue;
-                        }
+                    println!("📝 File content changed: '{}' -> '{}'", 
+                             current_content.chars().take(50).collect::<String>(),
+                             new_content.chars().take(50).collect::<String>());
+                    
+                    // Use Loro's update method to let CRDT handle merging naturally
+                    // This preserves CRDT semantics instead of doing full replacement
+                    if let Err(e) = text.update(&new_content, Default::default()) {
+                        println!("❌ Failed to update text: {e}");
+                        continue;
                     }
                     
-                    // Commit and sync changes
+                    // Commit and sync changes - let Loro merge concurrent edits
                     if let Err(e) = protocol.commit_and_sync() {
                         println!("❌ Failed to commit and sync: {e}");
                     } else {
-                        println!("📝 File change detected and synced to all peers");
+                        println!("📝 File change detected and synced to all peers (content length: {})", new_content.len());
                     }
                 }
             }

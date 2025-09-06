@@ -1,5 +1,7 @@
 {
     "cSpell.words": [
         "ALPN"
-    ]
+    ],
+    "files.autoSave": "afterDelay",
+    "files.autoSaveDelay": 100
 }
