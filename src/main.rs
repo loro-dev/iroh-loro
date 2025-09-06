@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, command};
+use iroh::Watcher;
 use iroh_loro::IrohLoroProtocol;
-use notify::Watcher;
+use notify::Watcher as NotifyWatcher;
+use rand_core::TryRngCore;
 use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 
 #[derive(Parser)]
@@ -30,8 +32,8 @@ async fn main() -> Result<()> {
             let contents = tokio::fs::read_to_string(&file_path).await?;
 
             let doc = loro::LoroDoc::new();
-            doc.get_text("text")
-                .update_by_line(&contents, loro::UpdateOptions::default())?;
+            let text = doc.get_text("text");
+            text.insert(0, &contents)?;
             doc.commit();
 
             println!("Serving file: {}", file_path);
@@ -112,16 +114,22 @@ async fn setup_protocol(
     file_path: String,
     tasks: &mut JoinSet<()>,
 ) -> Result<IrohLoroProtocol> {
-    let (tx, mut rx) = mpsc::channel(100);
-    let protocol = IrohLoroProtocol::new(doc, tx);
+    let (change_broadcaster, mut change_receiver) = broadcast::channel::<Vec<u8>>(1000);
+    let protocol = IrohLoroProtocol::new(doc, change_broadcaster);
 
-    // Spawn file writer task
+    // Spawn file writer task that handles document changes
+    let protocol_for_file_writer = protocol.clone();
     tasks.spawn(async move {
-        while let Some(contents) = rx.recv().await {
-            println!("💾 Writing new contents to file. Length={}", contents.len());
-            match tokio::fs::write(&file_path, contents).await {
+        while let Ok(_changes) = change_receiver.recv().await {
+            // Get the current text content from the document
+            let doc = protocol_for_file_writer.doc();
+            let text = doc.get_text("text");
+            let content = text.to_string();
+            
+            println!("💾 Writing document content to file. Length={}", content.len());
+            match tokio::fs::write(&file_path, &content).await {
                 Ok(_) => println!("✅ Successfully wrote to file"),
-                Err(e) => println!("❌ Failed to write to file: {}", e),
+                Err(e) => println!("❌ Failed to write to file: {e}"),
             }
         }
     });
@@ -135,15 +143,37 @@ async fn setup_node(
     key_path: Option<&str>,
 ) -> Result<iroh::protocol::Router> {
     let secret_key = if let Some(key_path) = key_path {
-        iroh_node_util::fs::load_secret_key(
-            dirs_next::cache_dir()
-                .context("no dir for secret key")?
-                .join("iroh-loro")
-                .join(key_path),
-        )
-        .await?
+        // Load or generate secret key
+        let key_file_path = dirs_next::cache_dir()
+            .context("no dir for secret key")?
+            .join("iroh-loro")
+            .join(key_path);
+        
+        if key_file_path.exists() {
+            let key_hex = tokio::fs::read_to_string(&key_file_path).await?;
+            let key_bytes = hex::decode(key_hex.trim())?;
+            let key_array: [u8; 32] = key_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+            iroh::SecretKey::from_bytes(&key_array)
+        } else {
+            // Create directory if it doesn't exist
+            if let Some(parent) = key_file_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            // Generate random bytes using rand_core 0.9.3 API
+            let mut key_bytes = [0u8; 32];
+            rand_core::OsRng.try_fill_bytes(&mut key_bytes).unwrap();
+            let key = iroh::SecretKey::from_bytes(&key_bytes);
+            let key_bytes = key.to_bytes();
+            tokio::fs::write(&key_file_path, hex::encode(key_bytes)).await?;
+            key
+        }
     } else {
-        iroh::SecretKey::generate(rand::rngs::OsRng)
+        {
+            // Generate random bytes using rand_core 0.9.3 API
+            let mut key_bytes = [0u8; 32];
+            rand_core::OsRng.try_fill_bytes(&mut key_bytes).unwrap();
+            iroh::SecretKey::from_bytes(&key_bytes)
+        }
     };
 
     let endpoint = iroh::Endpoint::builder()
@@ -158,7 +188,8 @@ async fn setup_node(
         .accept(IrohLoroProtocol::ALPN, protocol)
         .spawn();
 
-    let addr = iroh.endpoint().node_addr().await?;
+    let mut node_addr_watcher = iroh.endpoint().node_addr();
+    let addr = node_addr_watcher.get().context("Failed to get node address")?;
     println!("Running\nNode Id: {}", addr.node_id);
 
     Ok(iroh)
@@ -166,33 +197,63 @@ async fn setup_node(
 
 // File watcher for watching given file path that updates the loro doc when it changes
 async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()> {
-    println!("👀 Starting file watcher for: {}", file_path);
-    let (notify_tx, mut notify_rx) = mpsc::channel(10);
-    let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = notify_tx.blocking_send(res); // ignore when the rx is dropped
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            if event.kind.is_modify() {
+                let _ = tx.try_send(());
+            }
+        }
     })?;
-
+    
     watcher.watch(
         std::path::Path::new(&file_path),
         notify::RecursiveMode::NonRecursive,
     )?;
-
-    while let Some(res) = notify_rx.recv().await {
-        match res? {
-            notify::Event {
-                kind: notify::EventKind::Modify(_),
-                ..
-            } => {
-                println!("📝 File modification detected");
-                let contents = tokio::fs::read_to_string(&file_path).await?;
-                println!("📖 Read file contents (length={})", contents.len());
-                protocol.update_doc(&contents)?;
+    
+    println!("👀 Watching file: {}", file_path);
+    
+    while rx.recv().await.is_some() {
+        // Small delay to avoid rapid fire events
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        match tokio::fs::read_to_string(&file_path).await {
+            Ok(new_content) => {
+                // Use the document directly for operations
+                let doc = protocol.doc();
+                let text = doc.get_text("text");
+                let current_content = text.to_string();
+                
+                if current_content != new_content {
+                    // Clear and insert new content
+                    let current_len = text.len_utf16();
+                    if current_len > 0 {
+                        if let Err(e) = text.delete(0, current_len) {
+                            println!("❌ Failed to delete text: {e}");
+                            continue;
+                        }
+                    }
+                    if !new_content.is_empty() {
+                        if let Err(e) = text.insert(0, &new_content) {
+                            println!("❌ Failed to insert text: {e}");
+                            continue;
+                        }
+                    }
+                    
+                    // Commit and sync changes
+                    if let Err(e) = protocol.commit_and_sync() {
+                        println!("❌ Failed to commit and sync: {e}");
+                    } else {
+                        println!("📝 File change detected and synced to all peers");
+                    }
+                }
             }
-            _ => {
-                // Ignoring other watcher events
+            Err(e) => {
+                println!("❌ Failed to read file: {e}");
             }
         }
     }
-
+    
     Ok(())
 }
