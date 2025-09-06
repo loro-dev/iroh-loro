@@ -1,1 +1,5 @@
 send this file to peer2.txt vvvv
+
+PEER EDIT: Testing ongoing sync after fix!
+
+HOST EDIT: Bidirectional sync is working! 🎉

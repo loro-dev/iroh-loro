@@ -85,7 +85,6 @@ impl IrohLoroProtocol {
         let data_len = export_data.len() as u32;
         send_stream.write_all(&data_len.to_le_bytes()).await?;
         send_stream.write_all(&export_data).await?;
-        send_stream.finish()?;
         
         println!("📤 Client sent document snapshot ({} bytes)", export_data.len());
         
@@ -217,7 +216,6 @@ impl IrohLoroProtocol {
         let data_len = export_data.len() as u32;
         send_stream.write_all(&data_len.to_le_bytes()).await?;
         send_stream.write_all(&export_data).await?;
-        send_stream.finish()?;
         
         println!("📤 Host sent document snapshot ({} bytes)", export_data.len());
         
