@@ -136,10 +136,20 @@ impl IrohLoroProtocol {
                         match result {
                             Ok(msg_buffer) => {
                                 println!("📥 Received sync message ({} bytes)", msg_buffer.len());
+                                
+                                // Debug: Show what we're importing
+                                println!("🔍 Importing data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
+                                
                                 if let Err(e) = protocol_for_import.import_changes(&msg_buffer) {
                                     println!("⚠️ Failed to import changes: {}", e);
                                 } else {
                                     println!("✅ Successfully imported and wrote to file");
+                                    
+                                    // Debug: Show current document state after import
+                                    let doc = protocol_for_import.doc();
+                                    let text = doc.get_text("text");
+                                    let content = text.to_string();
+                                    println!("📄 Document content after import: '{}'", content);
                                 }
                             }
                             Err(_) => break,
