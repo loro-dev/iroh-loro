@@ -118,7 +118,7 @@ impl IrohLoroProtocol {
                         println!("📤 Forwarded changes to peer ({} bytes)", changes.len());
                     }
                     
-                    // Receive changes from peer
+                    // Receive changes from peer (including initial snapshot)
                     result = async {
                         let mut buffer = [0u8; 4];
                         match recv_stream.read_exact(&mut buffer).await {
@@ -138,6 +138,8 @@ impl IrohLoroProtocol {
                                 println!("📥 Received sync message ({} bytes)", msg_buffer.len());
                                 if let Err(e) = protocol_for_import.import_changes(&msg_buffer) {
                                     println!("⚠️ Failed to import changes: {}", e);
+                                } else {
+                                    println!("✅ Successfully imported and wrote to file");
                                 }
                             }
                             Err(_) => break,
