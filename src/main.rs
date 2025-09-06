@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use clap::{Parser, command};
-use iroh::Watcher;
 use iroh_loro::IrohLoroProtocol;
 use notify::Watcher as NotifyWatcher;
 use rand_core::TryRngCore;
@@ -198,9 +197,9 @@ async fn setup_node(
         .accept(IrohLoroProtocol::ALPN, protocol)
         .spawn();
 
-    let mut node_addr_watcher = iroh.endpoint().node_addr();
-    let addr = node_addr_watcher.get().context("Failed to get node address")?;
-    println!("Running\nNode Id: {}", addr.node_id);
+    // Get the node ID directly from the endpoint
+    let node_id = iroh.endpoint().node_id();
+    println!("Running\nNode Id: {}", node_id);
 
     Ok(iroh)
 }
