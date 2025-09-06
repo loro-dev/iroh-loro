@@ -151,9 +151,19 @@ async fn setup_node(
         
         if key_file_path.exists() {
             let key_hex = tokio::fs::read_to_string(&key_file_path).await?;
-            let key_bytes = hex::decode(key_hex.trim())?;
-            let key_array: [u8; 32] = key_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid key length"))?;
-            iroh::SecretKey::from_bytes(&key_array)
+            let key_hex = key_hex.trim();
+            if key_hex.is_empty() {
+                // File exists but is empty, generate new key
+                let mut key_bytes = [0u8; 32];
+                rand_core::OsRng.try_fill_bytes(&mut key_bytes).unwrap();
+                let key = iroh::SecretKey::from_bytes(&key_bytes);
+                tokio::fs::write(&key_file_path, hex::encode(key.to_bytes())).await?;
+                key
+            } else {
+                let key_bytes = hex::decode(key_hex)?;
+                let key_array: [u8; 32] = key_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+                iroh::SecretKey::from_bytes(&key_array)
+            }
         } else {
             // Create directory if it doesn't exist
             if let Some(parent) = key_file_path.parent() {
