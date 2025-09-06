@@ -1,5 +1,0 @@
-Hello from the P2P collaborative editor!
-
-This is a test file to demonstrate real-time synchronization between multiple peers.
-
-Try editing this file from different terminals and watch the changes sync automatically.
