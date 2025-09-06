@@ -88,16 +88,6 @@ impl IrohLoroProtocol {
         
         println!("📤 Sent document snapshot ({} bytes)", export_data.len());
         
-        // Receive and import the peer's initial document state
-        let mut buffer = [0u8; 4];
-        recv_stream.read_exact(&mut buffer).await?;
-        let msg_len = u32::from_le_bytes(buffer) as usize;
-        let mut msg_buffer = vec![0u8; msg_len];
-        recv_stream.read_exact(&mut msg_buffer).await?;
-        
-        println!("📥 Received initial document snapshot ({} bytes)", msg_buffer.len());
-        self.import_changes(&msg_buffer)?;
-        
         // Subscribe to changes to forward to this peer
         let mut change_receiver = self.change_broadcaster.subscribe();
         let (change_tx, mut change_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
@@ -146,7 +136,9 @@ impl IrohLoroProtocol {
                         match result {
                             Ok(msg_buffer) => {
                                 println!("📥 Received sync message ({} bytes)", msg_buffer.len());
-                                let _ = protocol_for_import.import_changes(&msg_buffer);
+                                if let Err(e) = protocol_for_import.import_changes(&msg_buffer) {
+                                    println!("⚠️ Failed to import changes: {}", e);
+                                }
                             }
                             Err(_) => break,
                         }
