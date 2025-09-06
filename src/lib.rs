@@ -88,25 +88,35 @@ impl IrohLoroProtocol {
         
         println!("📤 Sent document snapshot ({} bytes)", export_data.len());
         
-        // Immediately receive the peer's snapshot before starting ongoing sync
-        let mut buffer = [0u8; 4];
-        recv_stream.read_exact(&mut buffer).await?;
-        let msg_len = u32::from_le_bytes(buffer) as usize;
-        let mut msg_buffer = vec![0u8; msg_len];
-        recv_stream.read_exact(&mut msg_buffer).await?;
+        // Use async tasks to avoid deadlock - both peers can send/receive simultaneously
+        let recv_task = {
+            let protocol_clone = self.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4];
+                if recv_stream.read_exact(&mut buffer).await.is_ok() {
+                    let msg_len = u32::from_le_bytes(buffer) as usize;
+                    let mut msg_buffer = vec![0u8; msg_len];
+                    if recv_stream.read_exact(&mut msg_buffer).await.is_ok() {
+                        println!("📥 Received initial snapshot ({} bytes)", msg_buffer.len());
+                        println!("🔍 Initial snapshot data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
+                        
+                        if let Err(e) = protocol_clone.import_changes(&msg_buffer) {
+                            println!("⚠️ Failed to import initial snapshot: {}", e);
+                        } else {
+                            println!("✅ Successfully imported initial snapshot");
+                            let doc = protocol_clone.doc();
+                            let text = doc.get_text("text");
+                            let content = text.to_string();
+                            println!("📄 Document content after initial import: '{}'", content);
+                        }
+                    }
+                }
+                recv_stream
+            })
+        };
         
-        println!("📥 Received initial snapshot ({} bytes)", msg_buffer.len());
-        println!("🔍 Initial snapshot data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
-        
-        if let Err(e) = self.import_changes(&msg_buffer) {
-            println!("⚠️ Failed to import initial snapshot: {}", e);
-        } else {
-            println!("✅ Successfully imported initial snapshot");
-            let doc = self.doc();
-            let text = doc.get_text("text");
-            let content = text.to_string();
-            println!("📄 Document content after initial import: '{}'", content);
-        }
+        // Wait for initial snapshot exchange to complete
+        let mut recv_stream = recv_task.await?;
         
         // Subscribe to changes to forward to this peer
         let mut change_receiver = self.change_broadcaster.subscribe();
