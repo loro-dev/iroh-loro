@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, RwLock};
 use sha2::{Sha256, Digest};
 
 #[derive(Clone, Debug)]
-pub struct IrohLoroProtocol {
+pub struct IrohLoroTextProtocol {
     doc: Arc<LoroDoc>,
     change_broadcaster: broadcast::Sender<Vec<u8>>, // Broadcast changes to all peers
     file_path: Option<String>, // Associated file path for writing back changes
@@ -22,7 +22,7 @@ pub enum ConsistencyMessage {
     ResyncRequest,
 }
 
-impl IrohLoroProtocol {
+impl IrohLoroTextProtocol {
     pub const ALPN: &'static [u8] = b"iroh/loro/1";
 
     pub fn new(doc: LoroDoc, change_broadcaster: broadcast::Sender<Vec<u8>>) -> Self {
@@ -386,7 +386,7 @@ impl IrohLoroProtocol {
     }
 }
 
-impl ProtocolHandler for IrohLoroProtocol {
+impl ProtocolHandler for IrohLoroTextProtocol {
     fn accept(&self, conn: iroh::endpoint::Connection) -> impl n0_future::Future<Output = Result<(), AcceptError>> + std::marker::Send {
         let this = self.clone();
         Box::pin(async move {

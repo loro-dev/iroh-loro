@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, command};
-use iroh_loro::IrohLoroProtocol;
+use iroh_loro::IrohLoroTextProtocol;
 use notify::Watcher as NotifyWatcher;
 use rand_core::TryRngCore;
 use tokio::signal;
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
             // Connect to remote node and sync
             let conn = iroh
                 .endpoint()
-                .connect(remote_id, IrohLoroProtocol::ALPN)
+                .connect(remote_id, IrohLoroTextProtocol::ALPN)
                 .await?;
 
             tasks.spawn(async move {
@@ -118,9 +118,9 @@ async fn setup_protocol(
     doc: loro::LoroDoc,
     file_path: String,
     tasks: &mut JoinSet<()>,
-) -> Result<IrohLoroProtocol> {
+) -> Result<IrohLoroTextProtocol> {
     let (change_broadcaster, mut change_receiver) = broadcast::channel::<Vec<u8>>(1000);
-    let protocol = IrohLoroProtocol::new(doc, change_broadcaster).with_file_path(file_path.clone());
+    let protocol = IrohLoroTextProtocol::new(doc, change_broadcaster).with_file_path(file_path.clone());
 
     // Spawn file writer task that handles document changes
     let protocol_for_file_writer = protocol.clone();
@@ -144,7 +144,7 @@ async fn setup_protocol(
 
 // Common setup function for both Serve and Join modes
 async fn setup_node(
-    protocol: IrohLoroProtocol,
+    protocol: IrohLoroTextProtocol,
     key_path: Option<&str>,
 ) -> Result<iroh::protocol::Router> {
     let secret_key = if let Some(key_path) = key_path {
@@ -199,7 +199,7 @@ async fn setup_node(
 
     // Create and configure iroh node
     let iroh = iroh::protocol::Router::builder(endpoint)
-        .accept(IrohLoroProtocol::ALPN, protocol)
+        .accept(IrohLoroTextProtocol::ALPN, protocol)
         .spawn();
 
     // Get the node ID directly from the endpoint
@@ -210,7 +210,7 @@ async fn setup_node(
 }
 
 // File watcher for watching given file path that updates the loro doc when it changes
-async fn watch_files(file_path: String, protocol: IrohLoroProtocol) -> Result<()> {
+async fn watch_files(file_path: String, protocol: IrohLoroTextProtocol) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
     
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
