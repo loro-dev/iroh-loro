@@ -76,47 +76,38 @@ impl IrohLoroProtocol {
 
 
     pub async fn initiate_sync(&self, conn: iroh::endpoint::Connection) -> Result<()> {
-        println!("🔄 Starting sync with peer");
+        println!("🔄 Starting sync with peer (as client)");
         
         let (mut send_stream, mut recv_stream) = conn.open_bi().await?;
         
-        // Send our current document state
+        // CLIENT: Send our snapshot first
         let export_data = self.export_snapshot()?;
         let data_len = export_data.len() as u32;
         send_stream.write_all(&data_len.to_le_bytes()).await?;
         send_stream.write_all(&export_data).await?;
+        send_stream.finish()?;
         
-        println!("📤 Sent document snapshot ({} bytes)", export_data.len());
+        println!("📤 Client sent document snapshot ({} bytes)", export_data.len());
         
-        // Use async tasks to avoid deadlock - both peers can send/receive simultaneously
-        let recv_task = {
-            let protocol_clone = self.clone();
-            tokio::spawn(async move {
-                let mut buffer = [0u8; 4];
-                if recv_stream.read_exact(&mut buffer).await.is_ok() {
-                    let msg_len = u32::from_le_bytes(buffer) as usize;
-                    let mut msg_buffer = vec![0u8; msg_len];
-                    if recv_stream.read_exact(&mut msg_buffer).await.is_ok() {
-                        println!("📥 Received initial snapshot ({} bytes)", msg_buffer.len());
-                        println!("🔍 Initial snapshot data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
-                        
-                        if let Err(e) = protocol_clone.import_changes(&msg_buffer) {
-                            println!("⚠️ Failed to import initial snapshot: {}", e);
-                        } else {
-                            println!("✅ Successfully imported initial snapshot");
-                            let doc = protocol_clone.doc();
-                            let text = doc.get_text("text");
-                            let content = text.to_string();
-                            println!("📄 Document content after initial import: '{}'", content);
-                        }
-                    }
-                }
-                recv_stream
-            })
-        };
+        // CLIENT: Then receive host's snapshot
+        let mut buffer = [0u8; 4];
+        recv_stream.read_exact(&mut buffer).await?;
+        let msg_len = u32::from_le_bytes(buffer) as usize;
+        let mut msg_buffer = vec![0u8; msg_len];
+        recv_stream.read_exact(&mut msg_buffer).await?;
         
-        // Wait for initial snapshot exchange to complete
-        let mut recv_stream = recv_task.await?;
+        println!("📥 Client received host snapshot ({} bytes)", msg_buffer.len());
+        println!("🔍 Host snapshot data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
+        
+        if let Err(e) = self.import_changes(&msg_buffer) {
+            println!("⚠️ Failed to import host snapshot: {}", e);
+        } else {
+            println!("✅ Successfully imported host snapshot");
+            let doc = self.doc();
+            let text = doc.get_text("text");
+            let content = text.to_string();
+            println!("📄 Document content after import: '{}'", content);
+        }
         
         // Subscribe to changes to forward to this peer
         let mut change_receiver = self.change_broadcaster.subscribe();
@@ -196,6 +187,94 @@ impl IrohLoroProtocol {
         Ok(())
     }
 
+    pub async fn accept_sync(&self, conn: iroh::endpoint::Connection) -> Result<()> {
+        println!("🔄 Starting sync with peer (as host)");
+        
+        let (mut send_stream, mut recv_stream) = conn.accept_bi().await?;
+        
+        // HOST: Receive client's snapshot first
+        let mut buffer = [0u8; 4];
+        recv_stream.read_exact(&mut buffer).await?;
+        let msg_len = u32::from_le_bytes(buffer) as usize;
+        let mut msg_buffer = vec![0u8; msg_len];
+        recv_stream.read_exact(&mut msg_buffer).await?;
+        
+        println!("📥 Host received client snapshot ({} bytes)", msg_buffer.len());
+        println!("🔍 Client snapshot data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
+        
+        if let Err(e) = self.import_changes(&msg_buffer) {
+            println!("⚠️ Failed to import client snapshot: {}", e);
+        } else {
+            println!("✅ Successfully imported client snapshot");
+            let doc = self.doc();
+            let text = doc.get_text("text");
+            let content = text.to_string();
+            println!("📄 Document content after import: '{}'", content);
+        }
+        
+        // HOST: Then send our snapshot
+        let export_data = self.export_snapshot()?;
+        let data_len = export_data.len() as u32;
+        send_stream.write_all(&data_len.to_le_bytes()).await?;
+        send_stream.write_all(&export_data).await?;
+        send_stream.finish()?;
+        
+        println!("📤 Host sent document snapshot ({} bytes)", export_data.len());
+        
+        // Continue with ongoing sync...
+        let mut change_receiver = self.change_broadcaster.subscribe();
+        let (change_tx, mut change_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+        
+        let protocol_for_import = self.clone();
+        
+        // Spawn task to forward local changes to this peer
+        let forward_task = tokio::spawn(async move {
+            while let Ok(changes) = change_receiver.recv().await {
+                if change_tx.send(changes).await.is_err() {
+                    break;
+                }
+            }
+        });
+        
+        // Spawn task to receive and import changes from this peer
+        let import_task = tokio::spawn(async move {
+            loop {
+                let mut buffer = [0u8; 4];
+                match recv_stream.read_exact(&mut buffer).await {
+                    Ok(_) => {
+                        let msg_len = u32::from_le_bytes(buffer) as usize;
+                        let mut msg_buffer = vec![0u8; msg_len];
+                        match recv_stream.read_exact(&mut msg_buffer).await {
+                            Ok(_) => {
+                                println!("📥 Received changes ({} bytes)", msg_buffer.len());
+                                if let Err(e) = protocol_for_import.import_changes(&msg_buffer) {
+                                    println!("⚠️ Failed to import changes: {}", e);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        
+        // Forward changes to peer
+        while let Some(changes) = change_rx.recv().await {
+            let data_len = changes.len() as u32;
+            if send_stream.write_all(&data_len.to_le_bytes()).await.is_err() {
+                break;
+            }
+            if send_stream.write_all(&changes).await.is_err() {
+                break;
+            }
+        }
+        
+        forward_task.abort();
+        import_task.abort();
+        
+        Ok(())
+    }
 }
 
 impl ProtocolHandler for IrohLoroProtocol {
@@ -203,7 +282,7 @@ impl ProtocolHandler for IrohLoroProtocol {
         let this = self.clone();
         Box::pin(async move {
             println!("🔌 Peer connected");
-            let result = this.initiate_sync(conn).await;
+            let result = this.accept_sync(conn).await;
             println!("🔌 Peer disconnected");
             if let Err(e) = result {
                 println!("❌ Error: {}", e);
