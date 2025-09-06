@@ -5,7 +5,6 @@ use iroh::protocol::{ProtocolHandler, AcceptError};
 use loro::{ExportMode, LoroDoc};
 use tokio::sync::broadcast;
 
-
 #[derive(Debug, Clone)]
 pub struct IrohLoroProtocol {
     doc: Arc<LoroDoc>,
