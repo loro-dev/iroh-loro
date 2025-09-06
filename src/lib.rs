@@ -5,10 +5,11 @@ use iroh::protocol::{ProtocolHandler, AcceptError};
 use loro::{ExportMode, LoroDoc};
 use tokio::sync::broadcast;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct IrohLoroProtocol {
     doc: Arc<LoroDoc>,
     change_broadcaster: broadcast::Sender<Vec<u8>>, // Broadcast changes to all peers
+    file_path: Option<String>, // Associated file path for writing back changes
 }
 
 impl IrohLoroProtocol {
@@ -18,7 +19,13 @@ impl IrohLoroProtocol {
         Self {
             doc: Arc::new(doc),
             change_broadcaster,
+            file_path: None,
         }
+    }
+
+    pub fn with_file_path(mut self, file_path: String) -> Self {
+        self.file_path = Some(file_path);
+        self
     }
 
     /// Get a reference to the underlying LoroDoc for direct operations
@@ -31,9 +38,21 @@ impl IrohLoroProtocol {
         Ok(self.doc.export(ExportMode::Snapshot)?)
     }
 
-    /// Import changes from another peer
+    /// Import changes from another peer and update associated file
     pub fn import_changes(&self, data: &[u8]) -> Result<()> {
         self.doc.import(data)?;
+        
+        // After importing changes, write updated content back to file if we have one
+        if let Some(file_path) = &self.file_path {
+            let text = self.doc.get_text("text");
+            let content = text.to_string();
+            if let Err(e) = std::fs::write(file_path, content) {
+                println!("⚠️ Failed to write updated content to file {}: {}", file_path, e);
+            } else {
+                println!("📝 Updated file {} with synced content", file_path);
+            }
+        }
+        
         Ok(())
     }
 

@@ -114,7 +114,7 @@ async fn setup_protocol(
     tasks: &mut JoinSet<()>,
 ) -> Result<IrohLoroProtocol> {
     let (change_broadcaster, mut change_receiver) = broadcast::channel::<Vec<u8>>(1000);
-    let protocol = IrohLoroProtocol::new(doc, change_broadcaster);
+    let protocol = IrohLoroProtocol::new(doc, change_broadcaster).with_file_path(file_path.clone());
 
     // Spawn file writer task that handles document changes
     let protocol_for_file_writer = protocol.clone();
