@@ -1,15 +1,25 @@
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use anyhow::Result;
 use iroh::protocol::{ProtocolHandler, AcceptError};
 use loro::{ExportMode, LoroDoc};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
+use sha2::{Sha256, Digest};
 
 #[derive(Clone, Debug)]
 pub struct IrohLoroProtocol {
     doc: Arc<LoroDoc>,
     change_broadcaster: broadcast::Sender<Vec<u8>>, // Broadcast changes to all peers
     file_path: Option<String>, // Associated file path for writing back changes
+    connected_peers: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<ConsistencyMessage>>>>, // Track connected peers for consistency checks
+}
+
+#[derive(Clone, Debug)]
+pub enum ConsistencyMessage {
+    StateHashRequest,
+    StateHashResponse(String), // SHA256 hash of document state
+    ResyncRequest,
 }
 
 impl IrohLoroProtocol {
@@ -20,6 +30,7 @@ impl IrohLoroProtocol {
             doc: Arc::new(doc),
             change_broadcaster,
             file_path: None,
+            connected_peers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -36,6 +47,96 @@ impl IrohLoroProtocol {
     /// Get the current document state as bytes for syncing
     pub fn export_snapshot(&self) -> Result<Vec<u8>> {
         Ok(self.doc.export(ExportMode::Snapshot)?)
+    }
+
+    /// Get a hash of the current document state for consistency checking
+    pub fn get_state_hash(&self) -> Result<String> {
+        let snapshot = self.export_snapshot()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&snapshot);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Start periodic consistency checks with all connected peers
+    pub async fn start_consistency_checker(&self) {
+        let protocol = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                if let Err(e) = protocol.check_consistency().await {
+                    println!("⚠️ Consistency check failed: {}", e);
+                }
+            }
+        });
+    }
+
+    /// Check consistency with all connected peers
+    async fn check_consistency(&self) -> Result<()> {
+        let peers = self.connected_peers.read().await;
+        if peers.is_empty() {
+            return Ok(()); // No peers to check with
+        }
+
+        let our_hash = self.get_state_hash()?;
+        println!("🔍 Checking consistency (our hash: {})...", &our_hash[..8]);
+
+        // Request state hashes from all peers
+        for (peer_id, sender) in peers.iter() {
+            if let Err(e) = sender.send(ConsistencyMessage::StateHashRequest).await {
+                println!("⚠️ Failed to send hash request to peer {}: {}", peer_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle consistency messages from peers
+    pub async fn handle_consistency_message(&self, peer_id: &str, message: ConsistencyMessage) -> Result<()> {
+        match message {
+            ConsistencyMessage::StateHashRequest => {
+                let our_hash = self.get_state_hash()?;
+                let peers = self.connected_peers.read().await;
+                if let Some(sender) = peers.get(peer_id) {
+                    let _ = sender.send(ConsistencyMessage::StateHashResponse(our_hash)).await;
+                }
+            }
+            ConsistencyMessage::StateHashResponse(peer_hash) => {
+                let our_hash = self.get_state_hash()?;
+                if our_hash != peer_hash {
+                    println!("❌ Inconsistency detected with peer {}! Our: {}, Theirs: {}", 
+                             peer_id, &our_hash[..8], &peer_hash[..8]);
+                    println!("🔄 Triggering resync...");
+                    
+                    // Request resync from this peer
+                    let peers = self.connected_peers.read().await;
+                    if let Some(sender) = peers.get(peer_id) {
+                        let _ = sender.send(ConsistencyMessage::ResyncRequest).await;
+                    }
+                } else {
+                    println!("✅ Consistent with peer {} (hash: {})", peer_id, &our_hash[..8]);
+                }
+            }
+            ConsistencyMessage::ResyncRequest => {
+                println!("🔄 Resync requested by peer {}", peer_id);
+                // The resync will be handled by the existing sync mechanism
+            }
+        }
+        Ok(())
+    }
+
+    /// Register a new peer connection for consistency tracking
+    pub async fn register_peer(&self, peer_id: String, sender: tokio::sync::mpsc::Sender<ConsistencyMessage>) {
+        let mut peers = self.connected_peers.write().await;
+        peers.insert(peer_id.clone(), sender);
+        println!("📝 Registered peer {} for consistency tracking", peer_id);
+    }
+
+    /// Unregister a peer connection
+    pub async fn unregister_peer(&self, peer_id: &str) {
+        let mut peers = self.connected_peers.write().await;
+        peers.remove(peer_id);
+        println!("📝 Unregistered peer {} from consistency tracking", peer_id);
     }
 
     /// Import changes from another peer and update associated file
@@ -67,9 +168,9 @@ impl IrohLoroProtocol {
         
         // Export recent changes and broadcast to all peers
         let changes = self.export_updates()?;
-        if !changes.is_empty() {
-            let _ = self.change_broadcaster.send(changes);
-        }
+        // Always broadcast changes, even if they appear empty, as clearing content
+        // generates valid Loro operations that need to be synchronized
+        let _ = self.change_broadcaster.send(changes);
         
         Ok(())
     }

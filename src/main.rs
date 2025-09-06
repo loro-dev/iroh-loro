@@ -40,6 +40,9 @@ async fn main() -> Result<()> {
             let protocol = setup_protocol(doc, file_path.clone(), &mut tasks).await?;
             let iroh = setup_node(protocol.clone(), Some("key.ed25519")).await?;
 
+            // Start consistency checker
+            protocol.start_consistency_checker().await;
+
             tasks.spawn(async move {
                 if let Err(e) = watch_files(file_path, protocol).await {
                     println!("❌ File watcher task failed: {e}");
@@ -61,6 +64,9 @@ async fn main() -> Result<()> {
 
             let protocol = setup_protocol(doc, file_path.clone(), &mut tasks).await?;
             let iroh = setup_node(protocol.clone(), None).await?;
+
+            // Start consistency checker
+            protocol.start_consistency_checker().await;
 
             tasks.spawn({
                 let protocol = protocol.clone();
@@ -187,7 +193,6 @@ async fn setup_node(
 
     let endpoint = iroh::Endpoint::builder()
         .discovery_n0()
-        .discovery_local_network()
         .secret_key(secret_key)
         .bind()
         .await?;

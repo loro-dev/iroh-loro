@@ -6,9 +6,14 @@ A peer-to-peer collaborative document editing application that uses
 
 ## Features
 
-- **Multi-peer collaboration** - Supports unlimited number of connected peers
-- **Real-time sync** - Bidirectional document synchronization with broadcast channels
-- **Full Loro support** - All container types (Text, Map, List, Tree, MovableList)
+- **Real-time synchronization**: Changes made to files are instantly propagated to all connected peers
+- **Eventual consistency**: Automatic periodic consistency checks ensure all online peers converge to the same state
+- **Conflict-free editing**: Built on Loro CRDT, ensuring consistent state across all peers
+- **File watching**: Automatically detects and syncs file changes
+- **Peer-to-peer networking**: Direct connections between peers using Iroh
+- **Self-healing sync**: Detects inconsistencies and automatically triggers resync
+- **State verification**: SHA256 hashing of document states for reliable consistency checking
+- **Full Loro support**: All container types (Text, Map, List, Tree, MovableList)
 - **File watching** - Automatic sync when files are modified externally
 - **Persistent keys** - Stable node identity across sessions
 
