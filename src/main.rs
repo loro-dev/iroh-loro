@@ -160,7 +160,8 @@ async fn setup_node(
             if key_hex.is_empty() {
                 // File exists but is empty, generate new key
                 let mut key_bytes = [0u8; 32];
-                rand_core::OsRng.try_fill_bytes(&mut key_bytes).unwrap();
+                rand_core::OsRng.try_fill_bytes(&mut key_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to generate new cryptographic key for empty key file '{}': {}. This may indicate insufficient system entropy or hardware RNG failure.", key_file_path.display(), e))?;
                 let key = iroh::SecretKey::from_bytes(&key_bytes);
                 tokio::fs::write(&key_file_path, hex::encode(key.to_bytes())).await?;
                 key
@@ -176,7 +177,8 @@ async fn setup_node(
             }
             // Generate random bytes using rand_core 0.9.3 API
             let mut key_bytes = [0u8; 32];
-            rand_core::OsRng.try_fill_bytes(&mut key_bytes).unwrap();
+            rand_core::OsRng.try_fill_bytes(&mut key_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to generate new persistent cryptographic key for host node at '{}': {}. Check system entropy availability and hardware RNG status.", key_file_path.display(), e))?;
             let key = iroh::SecretKey::from_bytes(&key_bytes);
             let key_bytes = key.to_bytes();
             tokio::fs::write(&key_file_path, hex::encode(key_bytes)).await?;
@@ -186,7 +188,8 @@ async fn setup_node(
         {
             // Generate random bytes using rand_core 0.9.3 API
             let mut key_bytes = [0u8; 32];
-            rand_core::OsRng.try_fill_bytes(&mut key_bytes).unwrap();
+            rand_core::OsRng.try_fill_bytes(&mut key_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to generate ephemeral cryptographic key for client node: {}. This may indicate system resource exhaustion, insufficient entropy, or hardware RNG failure.", e))?;
             iroh::SecretKey::from_bytes(&key_bytes)
         }
     };

@@ -140,14 +140,14 @@ impl IrohLoroTextProtocol {
     }
 
     /// Import changes from another peer and update associated file
-    pub fn import_changes(&self, data: &[u8]) -> Result<()> {
+    pub async fn import_changes(&self, data: &[u8]) -> Result<()> {
         self.doc.import(data)?;
         
         // After importing changes, write updated content back to file if we have one
         if let Some(file_path) = &self.file_path {
             let text = self.doc.get_text("text");
             let content = text.to_string();
-            if let Err(e) = std::fs::write(file_path, content) {
+            if let Err(e) = tokio::fs::write(file_path, content).await {
                 println!("⚠️ Failed to write updated content to file {}: {}", file_path, e);
             } else {
                 println!("📝 Updated file {} with synced content", file_path);
@@ -209,7 +209,7 @@ impl IrohLoroTextProtocol {
         println!("📥 Client received host snapshot ({} bytes)", msg_buffer.len());
         println!("🔍 Host snapshot data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
         
-        if let Err(e) = self.import_changes(&msg_buffer) {
+        if let Err(e) = self.import_changes(&msg_buffer).await {
             println!("⚠️ Failed to import host snapshot: {}", e);
         } else {
             println!("✅ Successfully imported host snapshot");
@@ -271,7 +271,7 @@ impl IrohLoroTextProtocol {
                                 // Debug: Show what we're importing
                                 println!("🔍 Importing data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
                                 
-                                if let Err(e) = protocol_for_import.import_changes(&msg_buffer) {
+                                if let Err(e) = protocol_for_import.import_changes(&msg_buffer).await {
                                     println!("⚠️ Failed to import changes: {}", e);
                                 } else {
                                     println!("✅ Successfully imported and wrote to file");
@@ -312,7 +312,7 @@ impl IrohLoroTextProtocol {
         println!("📥 Host received client snapshot ({} bytes)", msg_buffer.len());
         println!("🔍 Client snapshot data: {:?}", String::from_utf8_lossy(&msg_buffer[..std::cmp::min(100, msg_buffer.len())]));
         
-        if let Err(e) = self.import_changes(&msg_buffer) {
+        if let Err(e) = self.import_changes(&msg_buffer).await {
             println!("⚠️ Failed to import client snapshot: {}", e);
         } else {
             println!("✅ Successfully imported client snapshot");
@@ -356,7 +356,7 @@ impl IrohLoroTextProtocol {
                         match recv_stream.read_exact(&mut msg_buffer).await {
                             Ok(_) => {
                                 println!("📥 Received changes ({} bytes)", msg_buffer.len());
-                                if let Err(e) = protocol_for_import.import_changes(&msg_buffer) {
+                                if let Err(e) = protocol_for_import.import_changes(&msg_buffer).await {
                                     println!("⚠️ Failed to import changes: {}", e);
                                 }
                             }
