@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::{endpoint::RecvStream, protocol::ProtocolHandler};
+use iroh::{endpoint::RecvStream, protocol::{AcceptError, ProtocolHandler}};
 use loro::{ExportMode, LoroDoc, UpdateOptions};
 use n0_future::{FuturesUnorderedBounded, StreamExt};
 use tokio::{select, sync::mpsc};
@@ -108,7 +108,8 @@ impl IrohLoroProtocol {
 }
 
 impl ProtocolHandler for IrohLoroProtocol {
-    fn accept(&self, conn: iroh::endpoint::Connection) -> n0_future::boxed::BoxFuture<Result<()>> {
+    #[allow(refining_impl_trait)]
+    fn accept(&self, conn: iroh::endpoint::Connection) -> n0_future::boxed::BoxFuture<Result<(), AcceptError>> {
         let this = self.clone();
         Box::pin(async move {
             println!("🔌 Peer connected");
@@ -116,7 +117,7 @@ impl ProtocolHandler for IrohLoroProtocol {
             println!("🔌 Peer disconnected");
             if let Err(e) = result {
                 println!("❌ Error: {}", e);
-                return Err(e);
+                return Err(AcceptError::User { source: e.into() });
             }
             Ok(())
         })
