@@ -1,10 +1,10 @@
 # iroh-loro demo
 
-A peer-to-peer collaborative text editing demo that uses
+A peer-to-peer collaborative **plain text** editing demo that uses
 [iroh](https://github.com/n0-computer/iroh) for p2p networking and
-[loro](https://github.com/loro-dev/loro) for CRDT-based text synchronization.
+[loro](https://github.com/loro-dev/loro) for CRDT-based **plain text** synchronization.
 
-> This demo only works for 2 peers and a single text file at the moment
+> This demo only works for 2 peers and a single **plain text** file at the moment
 
 ## Usage
 
