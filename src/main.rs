@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use clap::{Parser, command};
+use anyhow::Result;
+use clap::Parser;
 use iroh_loro::IrohLoroProtocol;
 use notify::Watcher;
 use tokio::signal;
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
             println!("Serving file: {}", file_path);
 
             let protocol = setup_protocol(doc, file_path.clone(), &mut tasks).await?;
-            let iroh = setup_node(protocol.clone(), Some("key.ed25519")).await?;
+            let iroh = setup_node(protocol.clone()).await?;
 
             tasks.spawn(async move {
                 if let Err(e) = watch_files(file_path, protocol).await {
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
             }
 
             let protocol = setup_protocol(doc, file_path.clone(), &mut tasks).await?;
-            let iroh = setup_node(protocol.clone(), None).await?;
+            let iroh = setup_node(protocol.clone()).await?;
 
             tasks.spawn({
                 let protocol = protocol.clone();
@@ -132,34 +132,18 @@ async fn setup_protocol(
 // Common setup function for both Serve and Join modes
 async fn setup_node(
     protocol: IrohLoroProtocol,
-    key_path: Option<&str>,
 ) -> Result<iroh::protocol::Router> {
-    let secret_key = if let Some(key_path) = key_path {
-        iroh_node_util::fs::load_secret_key(
-            dirs_next::cache_dir()
-                .context("no dir for secret key")?
-                .join("iroh-loro")
-                .join(key_path),
-        )
-        .await?
-    } else {
-        iroh::SecretKey::generate(rand::rngs::OsRng)
-    };
-
     let endpoint = iroh::Endpoint::builder()
-        .discovery_n0()
         .discovery_local_network()
-        .secret_key(secret_key)
         .bind()
         .await?;
 
-    // Create and configure iroh node
     let iroh = iroh::protocol::Router::builder(endpoint)
         .accept(IrohLoroProtocol::ALPN, protocol)
         .spawn();
 
-    let addr = iroh.endpoint().node_addr().await?;
-    println!("Running\nNode Id: {}", addr.node_id);
+    let node_id = iroh.endpoint().node_id();
+    println!("Running\nNode Id: {}", node_id);
 
     Ok(iroh)
 }
